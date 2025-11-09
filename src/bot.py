@@ -106,17 +106,20 @@ def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any
 
         # Get all values and create records manually to avoid duplicate header issues
         all_values = sheet.get_all_values()
-        if not all_values or len(all_values) < 2:
+        if not all_values or len(all_values) < 3:
             logger.warning("Sheet is empty or has no data rows")
             return None
 
-        # First row is headers
-        headers = all_values[0]
+        # Second row is headers (first row might be empty or title)
+        headers = all_values[1]
+        logger.info(f"Sheet headers: {headers}")
+
         records = []
-        for row in all_values[1:]:  # Skip header row
+        for row in all_values[2:]:  # Skip first two rows (title + headers)
             if row:  # Skip empty rows
                 record = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
                 records.append(record)
+                logger.info(f"Read row data: {record}")
 
         # Check if search value looks like username
         is_username = search_value.startswith('@') or not any(c.isdigit() for c in search_value)
