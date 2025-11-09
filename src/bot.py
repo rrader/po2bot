@@ -36,6 +36,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS")
 SPREADSHEET_ID = "1uuGXerA9I0eHTR2fNkektO8uS47T0zR1ITZIA1pnyBM"
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Test")  # Default to "Test" for staging
+ROOMMATES_WORKSHEET_NAME = os.getenv("ROOMMATES_WORKSHEET_NAME", "СпівмешканціTest")  # Default to "СпівмешканціTest" for staging
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -184,7 +185,7 @@ def add_to_google_sheets(user_data: dict, admin_name: str, worksheet_name: str =
 
 
 def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_number: str) -> bool:
-    """Add roommate data to СпівмешканціTest worksheet."""
+    """Add roommate data to roommates worksheet."""
     if not google_sheets_client:
         logger.warning("Google Sheets client not initialized, skipping sheet update")
         return False
@@ -192,13 +193,12 @@ def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_numb
     try:
         spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
 
-        # Get or create Співмешканці worksheet
-        worksheet_name = "СпівмешканціTest"
+        # Get or create roommates worksheet
         try:
-            sheet = spreadsheet.worksheet(worksheet_name)
+            sheet = spreadsheet.worksheet(ROOMMATES_WORKSHEET_NAME)
         except:
             # Create worksheet if doesn't exist
-            sheet = spreadsheet.add_worksheet(title=worksheet_name, rows=100, cols=10)
+            sheet = spreadsheet.add_worksheet(title=ROOMMATES_WORKSHEET_NAME, rows=100, cols=10)
             # Add headers
             sheet.append_row([
                 "Дата/час", "Ім'я співмешканця", "Прізвище співмешканця", "Username співмешканця",
@@ -219,7 +219,7 @@ def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_numb
         ]
 
         sheet.append_row(row)
-        logger.info(f"Successfully added roommate {roommate_data.get('user_id')} to СпівмешканціTest")
+        logger.info(f"Successfully added roommate {roommate_data.get('user_id')} to {ROOMMATES_WORKSHEET_NAME}")
         return True
 
     except Exception as e:
