@@ -8,6 +8,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
+    ChatMemberHandler,
     filters,
     ContextTypes,
 )
@@ -214,6 +215,40 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log when bot is added to a group."""
+    result = update.my_chat_member
+    chat = result.chat
+    new_status = result.new_chat_member.status
+    old_status = result.old_chat_member.status
+
+    # Check if bot was added to a group/channel
+    if chat.type in ["group", "supergroup", "channel"]:
+        if old_status in ["left", "kicked"] and new_status in ["member", "administrator"]:
+            logger.info(
+                f"Bot added to {chat.type}: '{chat.title}'\n"
+                f"Chat ID: {chat.id}\n"
+                f"Status: {new_status}"
+            )
+
+            # Try to send a message with chat info
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=(
+                        f"✅ Bot has been added to this {chat.type}!\n\n"
+                        f"📋 Chat Information:\n"
+                        f"Title: {chat.title}\n"
+                        f"Chat ID: `{chat.id}`\n"
+                        f"Type: {chat.type}\n\n"
+                        f"Use this Chat ID in your .env configuration."
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Could not send message to chat {chat.id}: {e}")
+
+
 def main() -> None:
     """Start the bot."""
     if not BOT_TOKEN:
@@ -249,6 +284,7 @@ def main() -> None:
     # Add handlers
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(approval_callback))
+    application.add_handler(ChatMemberHandler(chat_member_updated, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Start bot
     logger.info("Bot started")
