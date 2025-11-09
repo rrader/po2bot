@@ -201,14 +201,15 @@ def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_numb
             sheet = spreadsheet.add_worksheet(title=ROOMMATES_WORKSHEET_NAME, rows=100, cols=10)
             # Add headers
             sheet.append_row([
-                "Дата/час", "Ім'я співмешканця", "Прізвище співмешканця", "Username співмешканця",
-                "Телефон співмешканця", "Ім'я власника", "Телефон власника", "Номер квартири"
+                "Дата/час", "Telegram User ID", "Ім'я співмешканця/орендаря", "Прізвище співмешканця/орендаря", "Username співмешканця/орендаря",
+                "Телефон співмешканця/орендаря", "Ім'я власника", "Телефон власника", "Номер квартири"
             ])
 
         # Prepare row data
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row = [
             now,
+            roommate_data.get("user_id", ""),
             roommate_data.get("first_name", ""),
             roommate_data.get("last_name", ""),
             roommate_data.get("username", ""),
@@ -463,12 +464,12 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
         await context.bot.send_message(
             chat_id=int(owner_user_id),
             text=(
-                f"👥 Запит на додавання співмешканця\n\n"
+                f"👥 Запит на додавання співмешканця/орендаря\n\n"
                 f"👤 Ім'я: {roommate_name}\n"
                 f"📱 Телефон: {roommate_phone}\n"
                 f"👥 Username: @{roommate_username if roommate_username != 'Немає' else 'Немає'}\n\n"
                 f"🏠 Квартира: {owner_data.get('Номер квартири')}\n\n"
-                "Ця людина хоче приєднатися як співмешканець. Підтверджуєте?"
+                "Ця людина хоче приєднатися як співмешканець/орендар. Підтверджуєте?"
             ),
             reply_markup=reply_markup
         )
@@ -765,7 +766,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=roommate_user_id,
                 text=(
-                    f"🎉 Вітаємо! Власник {owner_name} підтвердив вас як співмешканця.\n\n"
+                    f"🎉 Вітаємо! Власник {owner_name} підтвердив вас як співмешканця/орендаря.\n\n"
                     f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
                 ),
             )
@@ -793,7 +794,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
         # Notify roommate
         await context.bot.send_message(
             chat_id=roommate_user_id,
-            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання як співмешканця."
+            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання як співмешканця/орендаря."
         )
 
         # Update owner's message
