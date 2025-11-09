@@ -287,6 +287,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and ask for phone number."""
     user = update.effective_user
 
+    # Clear any previous state
+    context.user_data.clear()
+
     # Create keyboard with phone number share button
     keyboard = [
         [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)]
@@ -963,7 +966,10 @@ def main() -> None:
             WAITING_APPROVAL: [],
             WAITING_OWNER_APPROVAL: [],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start)
+        ],
     )
 
     # Add handlers
