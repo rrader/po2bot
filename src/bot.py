@@ -65,8 +65,30 @@ admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
 roommate_approval_state: Dict[int, dict] = {}  # {message_id: {roommate_user_id, owner_phone, etc}}
 
 
-def find_owner_by_phone(phone_number: str) -> Optional[Dict[str, any]]:
-    """Find owner in Google Sheets by phone number. Returns record with Telegram User ID."""
+def normalize_phone(phone: str) -> str:
+    """Normalize phone number to format 380XXXXXXXXX."""
+    # Remove all non-digit characters
+    digits = ''.join(filter(str.isdigit, phone))
+
+    # Convert to 380 format
+    if digits.startswith('380'):
+        # Already in correct format
+        pass
+    elif digits.startswith('0') and len(digits) == 10:
+        # Format: 0501234567 -> 380501234567
+        digits = '38' + digits
+    elif len(digits) == 9:
+        # Format: 501234567 -> 380501234567
+        digits = '380' + digits
+    elif digits.startswith('38') and len(digits) == 11:
+        # Format: 38501234567 -> 380501234567
+        digits = '380' + digits[2:]
+
+    return digits
+
+
+def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any]]:
+    """Find owner in Google Sheets by phone number or username. Returns record with Telegram User ID."""
     if not google_sheets_client:
         logger.warning("Google Sheets client not initialized")
         return None
@@ -78,13 +100,28 @@ def find_owner_by_phone(phone_number: str) -> Optional[Dict[str, any]]:
         # Get all records
         records = sheet.get_all_records()
 
-        # Search for owner by phone number (column: Телефон)
-        for record in records:
-            if str(record.get("Телефон", "")).strip() == phone_number.strip():
-                logger.info(f"Found owner with phone {phone_number}: {record}")
-                return record
+        # Check if search value looks like username
+        is_username = search_value.startswith('@') or not any(c.isdigit() for c in search_value)
 
-        logger.info(f"No owner found with phone {phone_number}")
+        if is_username:
+            # Search by username (remove @ if present)
+            username_to_search = search_value.lstrip('@').strip().lower()
+            for record in records:
+                record_username = str(record.get("Username", "")).strip().lower()
+                if record_username == username_to_search:
+                    logger.info(f"Found owner with username {search_value}: {record}")
+                    return record
+            logger.info(f"No owner found with username {search_value}")
+        else:
+            # Search by phone number
+            normalized_phone = normalize_phone(search_value)
+            for record in records:
+                record_phone = normalize_phone(str(record.get("Телефон", "")))
+                if record_phone == normalized_phone:
+                    logger.info(f"Found owner with phone {search_value}: {record}")
+                    return record
+            logger.info(f"No owner found with phone {search_value}")
+
         return None
 
     except Exception as e:
@@ -321,8 +358,10 @@ async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["is_owner"] = False
 
         await update.message.reply_text(
-            "Будь ласка, вкажіть номер телефону власника квартири.\n\n"
-            "Формат: +380501234567"
+            "Будь ласка, вкажіть номер телефону або username власника квартири.\n\n"
+            "Формат телефону: 380501234567 або 0501234567\n"
+            "(без пробілів, без +)\n\n"
+            "Або username: @username (можна без @)"
         )
 
         return ROOMMATE_OWNER_PHONE
@@ -335,17 +374,20 @@ async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def roommate_owner_phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle owner phone number for roommate."""
-    owner_phone = update.message.text.strip()
-    context.user_data["owner_phone"] = owner_phone
+    """Handle owner phone number or username for roommate."""
+    owner_search = update.message.text.strip()
+    context.user_data["owner_search"] = owner_search
 
     # Search for owner in Google Sheets
-    owner_data = find_owner_by_phone(owner_phone)
+    owner_data = find_owner_by_phone_or_username(owner_search)
 
     if not owner_data:
         await update.message.reply_text(
-            "❌ Власника з таким номером телефону не знайдено в системі.\n\n"
-            "Переконайтеся, що власник вже пройшов верифікацію та доданий до групи.\n\n"
+            "❌ Власника з таким номером телефону або username не знайдено в системі.\n\n"
+            "Переконайтеся, що:\n"
+            "• Власник вже пройшов верифікацію та доданий до групи\n"
+            "• Телефон вказаний у форматі 380501234567 або 0501234567\n"
+            "• Username вказаний правильно\n\n"
             "Використайте /start щоб почати спочатку."
         )
         return ConversationHandler.END
@@ -408,9 +450,13 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
             reply_markup=reply_markup
         )
 
+        owner_first_name = owner_data.get("Ім'я", "")
+        owner_last_name = owner_data.get("Прізвище", "")
+        apartment = owner_data.get("Номер квартири", "")
+
         await update.message.reply_text(
-            f"✅ Знайдено власника: {owner_data.get('Ім\\'я')} {owner_data.get('Прізвище')}\n"
-            f"Квартира: {owner_data.get('Номер квартири')}\n\n"
+            f"✅ Знайдено власника: {owner_first_name} {owner_last_name}\n"
+            f"Квартира: {apartment}\n\n"
             "⏳ Запит надіслано власнику. Очікуйте підтвердження..."
         )
 
