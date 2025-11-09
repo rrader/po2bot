@@ -1,6 +1,7 @@
 import os
 import logging
-from typing import Dict
+import json
+from typing import Dict, Optional
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +14,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from dotenv import load_dotenv
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -27,12 +29,72 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # Conversation states
-PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, WAITING_APPROVAL = range(6)
+PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, CONFIRM_DATA, WAITING_APPROVAL = range(7)
 
 # Store pending requests
 pending_requests: Dict[int, dict] = {}
+
+
+async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]:
+    """Parse document image using OpenAI Vision API."""
+    if not openai_client:
+        logger.error("OpenAI client not initialized")
+        return None
+
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Проаналізуй це зображення документа (договір інвестування або витяг з реєстру права власності) та витягни наступну інформацію:
+1. Номер квартири/приміщення
+2. Площу квартири/приміщення (в квадратних метрах)
+3. Тип документа (або "Договір інвестування" або "Право власності (витяг з реєстру)")
+
+Поверни відповідь ТІЛЬКИ у форматі JSON без додаткового тексту:
+{
+  "apartment_number": "номер квартири",
+  "area": "площа",
+  "document_type": "тип документа"
+}
+
+Якщо якась інформація не розбірлива або відсутня, вкажи null для цього поля."""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=300
+        )
+
+        content = response.choices[0].message.content.strip()
+        logger.info(f"OpenAI response: {content}")
+
+        # Parse JSON response
+        parsed_data = json.loads(content)
+        return parsed_data
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse OpenAI JSON response: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error calling OpenAI API: {e}")
+        return None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -84,7 +146,7 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle document upload and ask for apartment number."""
+    """Handle document upload and try to parse it with OpenAI."""
     if not update.message.photo:
         await update.message.reply_text(
             "❌ Будь ласка, надішліть фото договору або витягу з реєстру.\n\n"
@@ -96,12 +158,55 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     photo = update.message.photo[-1]
     context.user_data["document_file_id"] = photo.file_id
 
-    await update.message.reply_text(
-        "✅ Фото документа отримано!\n\n"
-        "Тепер, будь ласка, вкажіть номер квартири:"
+    # Show processing message
+    processing_msg = await update.message.reply_text(
+        "⏳ Обробляю документ, зачекайте..."
     )
 
-    return APARTMENT_NUMBER
+    # Get photo URL for OpenAI
+    file = await context.bot.get_file(photo.file_id)
+    image_url = file.file_path
+
+    # Try to parse document with OpenAI
+    parsed_data = await parse_document_with_openai(image_url)
+
+    # Delete processing message
+    await processing_msg.delete()
+
+    if parsed_data and all(parsed_data.get(k) for k in ["apartment_number", "area", "document_type"]):
+        # Successfully parsed all data
+        context.user_data["apartment_number"] = parsed_data["apartment_number"]
+        context.user_data["area"] = parsed_data["area"]
+        context.user_data["document_type"] = parsed_data["document_type"]
+
+        # Create confirmation keyboard
+        keyboard = [
+            [KeyboardButton("✅ Так, все вірно")],
+            [KeyboardButton("✏️ Ні, я виправлю вручну")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+        await update.message.reply_text(
+            f"✅ Документ оброблено!\n\n"
+            f"📋 Виявлені дані:\n"
+            f"🏠 Номер квартири: {parsed_data['apartment_number']}\n"
+            f"📐 Площа: {parsed_data['area']} м²\n"
+            f"📄 Тип документа: {parsed_data['document_type']}\n\n"
+            f"Чи всі дані вірні?",
+            reply_markup=reply_markup
+        )
+
+        return CONFIRM_DATA
+    else:
+        # Failed to parse or incomplete data - ask manually
+        logger.warning(f"Failed to parse document or incomplete data: {parsed_data}")
+        await update.message.reply_text(
+            "⚠️ Не вдалося автоматично розпізнати всі дані з документа.\n\n"
+            "Будь ласка, введіть дані вручну.\n\n"
+            "Спочатку вкажіть номер квартири:"
+        )
+
+        return APARTMENT_NUMBER
 
 
 async def apartment_number_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -138,10 +243,51 @@ async def area_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return DOCUMENT_TYPE
 
 
+async def confirm_data_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle data confirmation."""
+    response = update.message.text.strip()
+
+    if "так" in response.lower() or "✅" in response:
+        # User confirmed data is correct, proceed to send to admin
+        return await send_to_admin(update, context)
+    else:
+        # User wants to correct data manually
+        await update.message.reply_text(
+            "Добре, введемо дані вручну.\n\n"
+            "Спочатку вкажіть номер квартири:"
+        )
+        return APARTMENT_NUMBER
+
+
 async def document_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle document type and send to admin group."""
+    """Handle document type and show confirmation."""
     document_type = update.message.text.strip()
     context.user_data["document_type"] = document_type
+
+    apartment_number = context.user_data.get("apartment_number", "")
+    area = context.user_data.get("area", "")
+
+    # Create confirmation keyboard
+    keyboard = [
+        [KeyboardButton("✅ Так, все вірно")],
+        [KeyboardButton("✏️ Ні, я виправлю вручну")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+    await update.message.reply_text(
+        f"📋 Перевірте введені дані:\n\n"
+        f"🏠 Номер квартири: {apartment_number}\n"
+        f"📐 Площа: {area} м²\n"
+        f"📄 Тип документа: {document_type}\n\n"
+        f"Чи всі дані вірні?",
+        reply_markup=reply_markup
+    )
+
+    return CONFIRM_DATA
+
+
+async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Send request to admin group."""
 
     user_id = context.user_data["user_id"]
     phone_number = context.user_data["phone_number"]
@@ -353,6 +499,9 @@ def main() -> None:
             ],
             DOCUMENT_TYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, document_type_received),
+            ],
+            CONFIRM_DATA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_data_received),
             ],
             WAITING_APPROVAL: [],
         },
