@@ -64,13 +64,6 @@ async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]
 2. Площу квартири/приміщення (в квадратних метрах)
 3. Тип документа (або "Договір інвестування" або "Право власності (витяг з реєстру)")
 
-Поверни відповідь ТІЛЬКИ у форматі JSON без додаткового тексту:
-{
-  "apartment_number": "номер квартири",
-  "area": "площа",
-  "document_type": "тип документа"
-}
-
 Якщо якась інформація не розбірлива або відсутня, вкажи null для цього поля."""
                         },
                         {
@@ -82,18 +75,45 @@ async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]
                     ]
                 }
             ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "document_data",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "apartment_number": {
+                                "type": ["string", "null"],
+                                "description": "Номер квартири/приміщення"
+                            },
+                            "area": {
+                                "type": ["string", "null"],
+                                "description": "Площа квартири в квадратних метрах"
+                            },
+                            "document_type": {
+                                "type": ["string", "null"],
+                                "description": "Тип документа: або 'Договір інвестування' або 'Право власності (витяг з реєстру)'"
+                            }
+                        },
+                        "required": ["apartment_number", "area", "document_type"],
+                        "additionalProperties": False
+                    }
+                }
+            },
             max_tokens=300
         )
 
         content = response.choices[0].message.content.strip()
         logger.info(f"OpenAI response: {content}")
 
-        # Parse JSON response
+        # Parse JSON response (guaranteed to be valid JSON with structured output)
         parsed_data = json.loads(content)
         return parsed_data
 
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse OpenAI JSON response: {e}")
+        logger.error(f"Content was: {content}")
         return None
     except Exception as e:
         logger.error(f"Error calling OpenAI API: {e}")
