@@ -112,14 +112,12 @@ def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any
 
         # Second row is headers (first row might be empty or title)
         headers = all_values[1]
-        logger.info(f"Sheet headers: {headers}")
 
         records = []
         for row in all_values[2:]:  # Skip first two rows (title + headers)
             if row:  # Skip empty rows
                 record = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
                 records.append(record)
-                logger.info(f"Read row data: {record}")
 
         # Check if search value looks like username
         is_username = search_value.startswith('@') or not any(c.isdigit() for c in search_value)
@@ -136,15 +134,11 @@ def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any
         else:
             # Search by phone number
             normalized_phone = normalize_phone(search_value)
-            logger.info(f"Searching for phone: {search_value} (normalized: {normalized_phone})")
-            logger.info(f"Total records to check: {len(records)}")
 
-            for i, record in enumerate(records):
-                record_phone_raw = str(record.get("Телефон", ""))
-                record_phone = normalize_phone(record_phone_raw)
-                logger.info(f"Record {i+1}: raw='{record_phone_raw}', normalized='{record_phone}'")
+            for record in records:
+                record_phone = normalize_phone(str(record.get("Телефон", "")))
                 if record_phone == normalized_phone:
-                    logger.info(f"Found owner with phone {search_value}: {record}")
+                    logger.info(f"Found owner with phone {search_value}")
                     return record
             logger.info(f"No owner found with phone {search_value}")
 
@@ -483,8 +477,12 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
         owner_last_name = owner_data.get("Прізвище", "")
         apartment = owner_data.get("Номер квартири", "")
 
+        # Build owner name - show only what's available
+        owner_name_parts = [owner_first_name, owner_last_name]
+        owner_full_name = " ".join(part for part in owner_name_parts if part)
+
         await update.message.reply_text(
-            f"✅ Знайдено власника: {owner_first_name} {owner_last_name}\n"
+            f"✅ Знайдено власника: {owner_full_name if owner_full_name else 'Без імені'}\n"
             f"Квартира: {apartment}\n\n"
             "⏳ Запит надіслано власнику. Очікуйте підтвердження..."
         )
