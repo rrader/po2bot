@@ -550,20 +550,50 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         return CONFIRM_DATA
     else:
-        # Failed to parse or incomplete data - ask manually
+        # Failed to parse or incomplete data - offer to retry or enter manually
         logger.warning(f"Failed to parse document or incomplete data: {parsed_data}")
+
+        # Create keyboard with options
+        keyboard = [
+            [KeyboardButton("📷 Завантажити нове фото")],
+            [KeyboardButton("✏️ Ввести дані вручну")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
         await update.message.reply_text(
             "⚠️ Не вдалося автоматично розпізнати всі дані з документа.\n\n"
-            "Будь ласка, введіть дані вручну.\n\n"
-            "Спочатку вкажіть номер квартири:"
+            "Оберіть, що робити далі:",
+            reply_markup=reply_markup
         )
 
         return APARTMENT_NUMBER
 
 
 async def apartment_number_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle apartment number and ask for area."""
-    apartment_number = update.message.text.strip()
+    """Handle apartment number or photo re-upload option."""
+    user_input = update.message.text.strip()
+
+    # Check if user wants to upload new photo
+    if "завантажити" in user_input.lower() or "📷" in user_input:
+        await update.message.reply_text(
+            "Добре! Завантажте нове фото договору інвестування/купівлі або витягу з реєстру.\n\n"
+            "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
+            "Головне, щоб було видно:\n"
+            "• Номер приміщення\n"
+            "• Площу"
+        )
+        return DOCUMENT
+
+    # Check if user wants to enter manually
+    if "вручну" in user_input.lower() or "✏️" in user_input:
+        await update.message.reply_text(
+            "Добре, введемо дані вручну.\n\n"
+            "Спочатку вкажіть номер квартири:"
+        )
+        return APARTMENT_NUMBER
+
+    # Regular apartment number input
+    apartment_number = user_input
     context.user_data["apartment_number"] = apartment_number
 
     await update.message.reply_text(
@@ -976,6 +1006,7 @@ def main() -> None:
                 MessageHandler(filters.PHOTO, document_received),
             ],
             APARTMENT_NUMBER: [
+                MessageHandler(filters.PHOTO, document_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apartment_number_received),
             ],
             AREA: [
