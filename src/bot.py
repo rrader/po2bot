@@ -29,7 +29,7 @@ ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID"))
 
 # Conversation states
-PHONE_NUMBER, DOCUMENT, WAITING_APPROVAL = range(3)
+PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, WAITING_APPROVAL = range(6)
 
 # Store pending requests
 pending_requests: Dict[int, dict] = {}
@@ -84,7 +84,7 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle document upload and send to admin group."""
+    """Handle document upload and ask for apartment number."""
     if not update.message.photo:
         await update.message.reply_text(
             "❌ Будь ласка, надішліть фото договору або витягу з реєстру.\n\n"
@@ -96,11 +96,61 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     photo = update.message.photo[-1]
     context.user_data["document_file_id"] = photo.file_id
 
+    await update.message.reply_text(
+        "✅ Фото документа отримано!\n\n"
+        "Тепер, будь ласка, вкажіть номер квартири:"
+    )
+
+    return APARTMENT_NUMBER
+
+
+async def apartment_number_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle apartment number and ask for area."""
+    apartment_number = update.message.text.strip()
+    context.user_data["apartment_number"] = apartment_number
+
+    await update.message.reply_text(
+        f"✅ Номер квартири: {apartment_number}\n\n"
+        "Тепер вкажіть площу квартири (в м²):"
+    )
+
+    return AREA
+
+
+async def area_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle area and ask for document type."""
+    area = update.message.text.strip()
+    context.user_data["area"] = area
+
+    # Create keyboard for document type
+    keyboard = [
+        [KeyboardButton("📄 Договір інвестування")],
+        [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+    await update.message.reply_text(
+        f"✅ Площа: {area} м²\n\n"
+        "Оберіть тип документа:",
+        reply_markup=reply_markup,
+    )
+
+    return DOCUMENT_TYPE
+
+
+async def document_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle document type and send to admin group."""
+    document_type = update.message.text.strip()
+    context.user_data["document_type"] = document_type
+
     user_id = context.user_data["user_id"]
     phone_number = context.user_data["phone_number"]
     username = context.user_data.get("username", "N/A")
     first_name = context.user_data.get("first_name", "")
     last_name = context.user_data.get("last_name", "")
+    apartment_number = context.user_data.get("apartment_number", "")
+    area = context.user_data.get("area", "")
+    photo_file_id = context.user_data.get("document_file_id", "")
 
     # Store request
     pending_requests[user_id] = {
@@ -108,7 +158,10 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "username": username,
         "first_name": first_name,
         "last_name": last_name,
-        "document_file_id": photo.file_id,
+        "document_file_id": photo_file_id,
+        "apartment_number": apartment_number,
+        "area": area,
+        "document_type": document_type,
     }
 
     # Create approval keyboard
@@ -125,13 +178,16 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     try:
         await context.bot.send_photo(
             chat_id=ADMIN_GROUP_ID,
-            photo=photo.file_id,
+            photo=photo_file_id,
             caption=(
                 "🆕 Новий запит на доступ\n\n"
                 f"👤 Ім'я: {first_name} {last_name}\n"
                 f"📱 Телефон: {phone_number}\n"
                 f"🆔 User ID: {user_id}\n"
                 f"👥 Username: @{username if username != 'N/A' else 'Немає'}\n\n"
+                f"🏠 Номер квартири: {apartment_number}\n"
+                f"📐 Площа: {area} м²\n"
+                f"📄 Тип документа: {document_type}\n\n"
                 "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
             ),
             reply_markup=reply_markup,
@@ -288,6 +344,15 @@ def main() -> None:
             ],
             DOCUMENT: [
                 MessageHandler(filters.PHOTO, document_received),
+            ],
+            APARTMENT_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, apartment_number_received),
+            ],
+            AREA: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, area_received),
+            ],
+            DOCUMENT_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, document_type_received),
             ],
             WAITING_APPROVAL: [],
         },
