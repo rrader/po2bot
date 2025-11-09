@@ -97,8 +97,19 @@ def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any
         spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
         sheet = spreadsheet.worksheet(WORKSHEET_NAME)
 
-        # Get all records
-        records = sheet.get_all_records()
+        # Get all values and create records manually to avoid duplicate header issues
+        all_values = sheet.get_all_values()
+        if not all_values or len(all_values) < 2:
+            logger.warning("Sheet is empty or has no data rows")
+            return None
+
+        # First row is headers
+        headers = all_values[0]
+        records = []
+        for row in all_values[1:]:  # Skip header row
+            if row:  # Skip empty rows
+                record = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
+                records.append(record)
 
         # Check if search value looks like username
         is_username = search_value.startswith('@') or not any(c.isdigit() for c in search_value)
