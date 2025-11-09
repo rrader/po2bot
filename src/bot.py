@@ -299,6 +299,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     last_name = context.user_data.get("last_name", "")
     apartment_number = context.user_data.get("apartment_number", "")
     area = context.user_data.get("area", "")
+    document_type = context.user_data.get("document_type", "")
     photo_file_id = context.user_data.get("document_file_id", "")
 
     # Store request
