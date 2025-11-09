@@ -2,6 +2,7 @@ import os
 import logging
 import json
 from typing import Dict, Optional
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -15,6 +16,8 @@ from telegram.ext import (
 )
 from dotenv import load_dotenv
 from openai import OpenAI
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # Load environment variables
 load_dotenv()
@@ -30,9 +33,24 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_SHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS")
+SPREADSHEET_ID = "1uuGXerA9I0eHTR2fNkektO8uS47T0zR1ITZIA1pnyBM"
+WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Test")  # Default to "Test" for staging
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# Initialize Google Sheets client
+google_sheets_client = None
+if GOOGLE_SHEETS_CREDS:
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds_dict = json.loads(GOOGLE_SHEETS_CREDS)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        google_sheets_client = gspread.authorize(creds)
+        logger.info("Google Sheets client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Google Sheets client: {e}")
 
 # Conversation states
 PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, CONFIRM_DATA, WAITING_APPROVAL = range(7)
@@ -42,6 +60,39 @@ pending_requests: Dict[int, dict] = {}
 
 # Store admin rejection states (waiting for reason)
 admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
+
+
+def add_to_google_sheets(user_data: dict, admin_name: str) -> bool:
+    """Add approved user data to Google Sheets."""
+    if not google_sheets_client:
+        logger.warning("Google Sheets client not initialized, skipping sheet update")
+        return False
+
+    try:
+        spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
+        sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+
+        # Prepare row data
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            now,  # Дата/час
+            user_data.get("first_name", ""),  # Ім'я
+            user_data.get("last_name", ""),  # Прізвище
+            user_data.get("username", ""),  # Username
+            user_data.get("phone_number", ""),  # Телефон
+            user_data.get("apartment_number", ""),  # Номер квартири
+            user_data.get("area", ""),  # Площа
+            user_data.get("document_type", ""),  # Тип документа
+            admin_name,  # Хто затвердив
+        ]
+
+        sheet.append_row(row)
+        logger.info(f"Successfully added user {user_data.get('user_id')} to Google Sheets")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to add to Google Sheets: {e}")
+        return False
 
 
 async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]:
@@ -409,12 +460,18 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 ),
             )
 
+            # Add to Google Sheets
+            add_to_google_sheets(request_data, admin_name)
+
             # Update admin message
             await query.edit_message_caption(
                 caption=query.message.caption + f"\n\n✅ ЗАТВЕРДЖЕНО {admin_name}"
             )
 
             logger.info(f"User {user_id} approved by {admin_name}")
+
+            # Remove from pending after successful approval
+            del pending_requests[user_id]
 
         except Exception as e:
             logger.error(f"Error approving user {user_id}: {e}")
