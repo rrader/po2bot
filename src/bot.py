@@ -53,7 +53,7 @@ if GOOGLE_SHEETS_CREDS:
         logger.error(f"Failed to initialize Google Sheets client: {e}")
 
 # Conversation states
-PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, CONFIRM_DATA, WAITING_APPROVAL = range(7)
+PHONE_NUMBER, USER_TYPE, DOCUMENT, ROOMMATE_OWNER_PHONE, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, CONFIRM_DATA, WAITING_APPROVAL, WAITING_OWNER_APPROVAL = range(10)
 
 # Store pending requests
 pending_requests: Dict[int, dict] = {}
@@ -61,8 +61,38 @@ pending_requests: Dict[int, dict] = {}
 # Store admin rejection states (waiting for reason)
 admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
 
+# Store roommate approval requests (waiting for owner confirmation)
+roommate_approval_state: Dict[int, dict] = {}  # {message_id: {roommate_user_id, owner_phone, etc}}
 
-def add_to_google_sheets(user_data: dict, admin_name: str) -> bool:
+
+def find_owner_by_phone(phone_number: str) -> Optional[Dict[str, any]]:
+    """Find owner in Google Sheets by phone number. Returns record with Telegram User ID."""
+    if not google_sheets_client:
+        logger.warning("Google Sheets client not initialized")
+        return None
+
+    try:
+        spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
+        sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+
+        # Get all records
+        records = sheet.get_all_records()
+
+        # Search for owner by phone number (column: Телефон)
+        for record in records:
+            if str(record.get("Телефон", "")).strip() == phone_number.strip():
+                logger.info(f"Found owner with phone {phone_number}: {record}")
+                return record
+
+        logger.info(f"No owner found with phone {phone_number}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Error searching for owner: {e}")
+        return None
+
+
+def add_to_google_sheets(user_data: dict, admin_name: str, worksheet_name: str = None) -> bool:
     """Add approved user data to Google Sheets."""
     if not google_sheets_client:
         logger.warning("Google Sheets client not initialized, skipping sheet update")
@@ -70,7 +100,7 @@ def add_to_google_sheets(user_data: dict, admin_name: str) -> bool:
 
     try:
         spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
-        sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+        sheet = spreadsheet.worksheet(worksheet_name or WORKSHEET_NAME)
 
         # Prepare row data
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -80,6 +110,7 @@ def add_to_google_sheets(user_data: dict, admin_name: str) -> bool:
             user_data.get("last_name", ""),  # Прізвище
             user_data.get("username", ""),  # Username
             user_data.get("phone_number", ""),  # Телефон
+            user_data.get("user_id", ""),  # Telegram User ID
             user_data.get("apartment_number", ""),  # Номер квартири
             user_data.get("area", ""),  # Площа
             user_data.get("document_type", ""),  # Тип документа
@@ -87,11 +118,55 @@ def add_to_google_sheets(user_data: dict, admin_name: str) -> bool:
         ]
 
         sheet.append_row(row)
-        logger.info(f"Successfully added user {user_data.get('user_id')} to Google Sheets")
+        logger.info(f"Successfully added user {user_data.get('user_id')} to Google Sheets ({worksheet_name or WORKSHEET_NAME})")
         return True
 
     except Exception as e:
         logger.error(f"Failed to add to Google Sheets: {e}")
+        return False
+
+
+def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_number: str) -> bool:
+    """Add roommate data to СпівмешканціTest worksheet."""
+    if not google_sheets_client:
+        logger.warning("Google Sheets client not initialized, skipping sheet update")
+        return False
+
+    try:
+        spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
+
+        # Get or create Співмешканці worksheet
+        worksheet_name = "СпівмешканціTest"
+        try:
+            sheet = spreadsheet.worksheet(worksheet_name)
+        except:
+            # Create worksheet if doesn't exist
+            sheet = spreadsheet.add_worksheet(title=worksheet_name, rows=100, cols=10)
+            # Add headers
+            sheet.append_row([
+                "Дата/час", "Ім'я співмешканця", "Прізвище співмешканця", "Username співмешканця",
+                "Телефон співмешканця", "Ім'я власника", "Телефон власника", "Номер квартири"
+            ])
+
+        # Prepare row data
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [
+            now,
+            roommate_data.get("first_name", ""),
+            roommate_data.get("last_name", ""),
+            roommate_data.get("username", ""),
+            roommate_data.get("phone_number", ""),
+            owner_data.get("Ім'я", "") + " " + owner_data.get("Прізвище", ""),
+            owner_data.get("Телефон", ""),
+            apartment_number,
+        ]
+
+        sheet.append_row(row)
+        logger.info(f"Successfully added roommate {roommate_data.get('user_id')} to СпівмешканціTest")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to add roommate to Google Sheets: {e}")
         return False
 
 
@@ -191,7 +266,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle phone number and ask for document."""
+    """Handle phone number and ask for user type."""
     contact = update.message.contact
 
     if contact and contact.user_id == update.effective_user.id:
@@ -202,8 +277,36 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["first_name"] = update.effective_user.first_name
         context.user_data["last_name"] = update.effective_user.last_name
 
+        # Ask if owner or roommate
+        keyboard = [
+            [KeyboardButton("🏠 Я власник квартири")],
+            [KeyboardButton("👥 Я співмешканець")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
         await update.message.reply_text(
             f"✅ Номер телефону отримано: {contact.phone_number}\n\n"
+            "Оберіть ваш статус:",
+            reply_markup=reply_markup
+        )
+
+        return USER_TYPE
+    else:
+        await update.message.reply_text(
+            "❌ Будь ласка, поділіться своїм власним номером телефону, використовуючи кнопку."
+        )
+        return PHONE_NUMBER
+
+
+async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle user type selection."""
+    user_type = update.message.text.strip()
+
+    if "власник" in user_type.lower():
+        # Owner flow - ask for document
+        context.user_data["is_owner"] = True
+
+        await update.message.reply_text(
             "Тепер, будь ласка, завантажте фото договору інвестування/купівлі або витягу з реєстру.\n\n"
             "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
             "Головне, щоб було видно:\n"
@@ -212,11 +315,113 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
         return DOCUMENT
+
+    elif "співмешканець" in user_type.lower():
+        # Roommate flow - ask for owner's phone
+        context.user_data["is_owner"] = False
+
+        await update.message.reply_text(
+            "Будь ласка, вкажіть номер телефону власника квартири.\n\n"
+            "Формат: +380501234567"
+        )
+
+        return ROOMMATE_OWNER_PHONE
+
     else:
         await update.message.reply_text(
-            "❌ Будь ласка, поділіться своїм власним номером телефону, використовуючи кнопку."
+            "❌ Будь ласка, оберіть один з варіантів, використовуючи кнопки."
         )
-        return PHONE_NUMBER
+        return USER_TYPE
+
+
+async def roommate_owner_phone_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle owner phone number for roommate."""
+    owner_phone = update.message.text.strip()
+    context.user_data["owner_phone"] = owner_phone
+
+    # Search for owner in Google Sheets
+    owner_data = find_owner_by_phone(owner_phone)
+
+    if not owner_data:
+        await update.message.reply_text(
+            "❌ Власника з таким номером телефону не знайдено в системі.\n\n"
+            "Переконайтеся, що власник вже пройшов верифікацію та доданий до групи.\n\n"
+            "Використайте /start щоб почати спочатку."
+        )
+        return ConversationHandler.END
+
+    context.user_data["owner_data"] = owner_data
+    context.user_data["apartment_number"] = owner_data.get("Номер квартири", "")
+
+    # Get owner's Telegram User ID
+    owner_user_id = owner_data.get("Telegram User ID")
+
+    if not owner_user_id:
+        await update.message.reply_text(
+            "❌ Власник знайдений, але у нього немає Telegram User ID в системі.\n\n"
+            "Це означає, що власник був доданий до старої версії бота.\n"
+            "Попросіть власника зв'язатися з адміністратором."
+        )
+        return ConversationHandler.END
+
+    # Send approval request to owner
+    roommate_name = f"{context.user_data['first_name']} {context.user_data.get('last_name', '')}"
+    roommate_phone = context.user_data["phone_number"]
+    roommate_username = context.user_data.get("username", "Немає")
+    roommate_user_id = context.user_data['user_id']
+
+    # Create approval keyboard
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Підтверджую", callback_data=f"approve_roommate_{roommate_user_id}"),
+            InlineKeyboardButton("❌ Відхилити", callback_data=f"reject_roommate_{roommate_user_id}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Store roommate request for owner approval
+    roommate_approval_state[roommate_user_id] = {
+        "roommate_user_id": roommate_user_id,
+        "roommate_data": {
+            "first_name": context.user_data['first_name'],
+            "last_name": context.user_data.get('last_name', ''),
+            "username": context.user_data.get('username', ''),
+            "phone_number": roommate_phone,
+            "user_id": roommate_user_id,
+        },
+        "owner_data": owner_data,
+        "apartment_number": owner_data.get("Номер квартири", ""),
+    }
+
+    # Send request to owner
+    try:
+        await context.bot.send_message(
+            chat_id=int(owner_user_id),
+            text=(
+                f"👥 Запит на додавання співмешканця\n\n"
+                f"👤 Ім'я: {roommate_name}\n"
+                f"📱 Телефон: {roommate_phone}\n"
+                f"👥 Username: @{roommate_username if roommate_username != 'Немає' else 'Немає'}\n\n"
+                f"🏠 Квартира: {owner_data.get('Номер квартири')}\n\n"
+                "Ця людина хоче приєднатися як співмешканець. Підтверджуєте?"
+            ),
+            reply_markup=reply_markup
+        )
+
+        await update.message.reply_text(
+            f"✅ Знайдено власника: {owner_data.get('Ім\\'я')} {owner_data.get('Прізвище')}\n"
+            f"Квартира: {owner_data.get('Номер квартири')}\n\n"
+            "⏳ Запит надіслано власнику. Очікуйте підтвердження..."
+        )
+
+        return WAITING_OWNER_APPROVAL
+
+    except Exception as e:
+        logger.error(f"Error sending message to owner: {e}")
+        await update.message.reply_text(
+            "❌ Не вдалося надіслати запит власнику. Спробуйте пізніше або зверніться до адміністратора."
+        )
+        return ConversationHandler.END
 
 
 async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -375,6 +580,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     # Store request
     pending_requests[user_id] = {
+        "user_id": user_id,
         "phone_number": phone_number,
         "username": username,
         "first_name": first_name,
@@ -426,11 +632,88 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return WAITING_APPROVAL
 
 
+async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle roommate approval/rejection by owner."""
+    parts = query.data.split("_")
+    action = parts[0] + "_" + parts[1]  # approve_roommate or reject_roommate
+    roommate_user_id = int(parts[2])
+
+    if roommate_user_id not in roommate_approval_state:
+        await query.edit_message_text(
+            text=query.message.text + "\n\n❌ Запит застарів або вже оброблений."
+        )
+        return
+
+    roommate_request = roommate_approval_state[roommate_user_id]
+    roommate_data = roommate_request["roommate_data"]
+    owner_data = roommate_request["owner_data"]
+    apartment_number = roommate_request["apartment_number"]
+    owner_name = query.from_user.first_name
+
+    if action == "approve_roommate":
+        try:
+            # Create invite link for roommate
+            invite_link = await context.bot.create_chat_invite_link(
+                chat_id=PRIVATE_GROUP_ID,
+                member_limit=1,
+            )
+
+            # Notify roommate
+            await context.bot.send_message(
+                chat_id=roommate_user_id,
+                text=(
+                    f"🎉 Вітаємо! Власник {owner_name} підтвердив вас як співмешканця.\n\n"
+                    f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
+                ),
+            )
+
+            # Add to Google Sheets (Співмешканці worksheet)
+            add_roommate_to_sheets(roommate_data, owner_data, apartment_number)
+
+            # Update owner's message
+            await query.edit_message_text(
+                text=query.message.text + f"\n\n✅ ПІДТВЕРДЖЕНО {owner_name}"
+            )
+
+            logger.info(f"Roommate {roommate_user_id} approved by owner {owner_name}")
+
+            # Clean up
+            del roommate_approval_state[roommate_user_id]
+
+        except Exception as e:
+            logger.error(f"Error approving roommate {roommate_user_id}: {e}")
+            await query.edit_message_text(
+                text=query.message.text + f"\n\n❌ Помилка: {str(e)}"
+            )
+
+    else:  # reject_roommate
+        # Notify roommate
+        await context.bot.send_message(
+            chat_id=roommate_user_id,
+            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання як співмешканця."
+        )
+
+        # Update owner's message
+        await query.edit_message_text(
+            text=query.message.text + f"\n\n❌ ВІДХИЛЕНО {owner_name}"
+        )
+
+        logger.info(f"Roommate {roommate_user_id} rejected by owner {owner_name}")
+
+        # Clean up
+        del roommate_approval_state[roommate_user_id]
+
+
 async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle approval/rejection from admin."""
+    """Handle approval/rejection from admin or owner."""
     query = update.callback_query
     await query.answer()
 
+    # Check if this is a roommate approval
+    if query.data.startswith("approve_roommate_") or query.data.startswith("reject_roommate_"):
+        return await handle_roommate_approval(query, context)
+
+    # Regular owner approval by admin
     action, user_id_str = query.data.split("_")
     user_id = int(user_id_str)
 
@@ -610,6 +893,12 @@ def main() -> None:
             PHONE_NUMBER: [
                 MessageHandler(filters.CONTACT, phone_number_received),
             ],
+            USER_TYPE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, user_type_received),
+            ],
+            ROOMMATE_OWNER_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_owner_phone_received),
+            ],
             DOCUMENT: [
                 MessageHandler(filters.PHOTO, document_received),
             ],
@@ -626,6 +915,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_data_received),
             ],
             WAITING_APPROVAL: [],
+            WAITING_OWNER_APPROVAL: [],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
