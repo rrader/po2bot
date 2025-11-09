@@ -41,13 +41,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # Create keyboard with phone number share button
     keyboard = [
-        [KeyboardButton("📱 Share Phone Number", request_contact=True)]
+        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
-        f"Hi {user.first_name}! Welcome to the verification process.\n\n"
-        "Please share your phone number by clicking the button below.",
+        f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації.\n\n"
+        "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче.",
         reply_markup=reply_markup,
     )
 
@@ -67,14 +67,18 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["last_name"] = update.effective_user.last_name
 
         await update.message.reply_text(
-            f"✅ Phone number received: {contact.phone_number}\n\n"
-            "Now, please upload a photo of your document (ID, passport, etc.)"
+            f"✅ Номер телефону отримано: {contact.phone_number}\n\n"
+            "Тепер, будь ласка, завантажте фото договору інвестування/купівлі або витягу з реєстру.\n\n"
+            "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
+            "Головне, щоб було видно:\n"
+            "• Номер приміщення\n"
+            "• Площу"
         )
 
         return DOCUMENT
     else:
         await update.message.reply_text(
-            "❌ Please share your own phone number using the button."
+            "❌ Будь ласка, поділіться своїм власним номером телефону, використовуючи кнопку."
         )
         return PHONE_NUMBER
 
@@ -83,7 +87,8 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Handle document upload and send to admin group."""
     if not update.message.photo:
         await update.message.reply_text(
-            "❌ Please send a photo of your document."
+            "❌ Будь ласка, надішліть фото договору або витягу з реєстру.\n\n"
+            "Не забудьте заблюрити особисті дані, але залишити видимими номер приміщення та площу."
         )
         return DOCUMENT
 
@@ -109,8 +114,8 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # Create approval keyboard
     keyboard = [
         [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{user_id}"),
+            InlineKeyboardButton("✅ Затвердити", callback_data=f"approve_{user_id}"),
+            InlineKeyboardButton("❌ Відхилити", callback_data=f"reject_{user_id}"),
         ]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -122,12 +127,12 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             chat_id=ADMIN_GROUP_ID,
             photo=photo.file_id,
             caption=(
-                "🆕 New Access Request\n\n"
-                f"👤 Name: {first_name} {last_name}\n"
-                f"📱 Phone: {phone_number}\n"
+                "🆕 Новий запит на доступ\n\n"
+                f"👤 Ім'я: {first_name} {last_name}\n"
+                f"📱 Телефон: {phone_number}\n"
                 f"🆔 User ID: {user_id}\n"
-                f"👥 Username: @{username if username != 'N/A' else 'None'}\n\n"
-                "Please review the document and approve or reject."
+                f"👥 Username: @{username if username != 'N/A' else 'Немає'}\n\n"
+                "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
             ),
             reply_markup=reply_markup,
         )
@@ -137,8 +142,8 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         raise
 
     await update.message.reply_text(
-        "✅ Your request has been submitted!\n\n"
-        "An admin will review your information and you'll be notified once approved."
+        "✅ Ваш запит надіслано!\n\n"
+        "Адміністратор перегляне вашу інформацію, і ви отримаєте повідомлення після схвалення."
     )
 
     return WAITING_APPROVAL
@@ -154,7 +159,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if user_id not in pending_requests:
         await query.edit_message_caption(
-            caption=query.message.caption + "\n\n❌ Request expired or already processed."
+            caption=query.message.caption + "\n\n❌ Запит застарів або вже оброблений."
         )
         return
 
@@ -173,14 +178,14 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await context.bot.send_message(
                 chat_id=user_id,
                 text=(
-                    f"🎉 Congratulations! Your request has been approved by {admin_name}.\n\n"
-                    f"Click here to join the private group:\n{invite_link.invite_link}"
+                    f"🎉 Вітаємо! Ваш запит схвалено адміністратором {admin_name}.\n\n"
+                    f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
                 ),
             )
 
             # Update admin message
             await query.edit_message_caption(
-                caption=query.message.caption + f"\n\n✅ APPROVED by {admin_name}"
+                caption=query.message.caption + f"\n\n✅ ЗАТВЕРДЖЕНО {admin_name}"
             )
 
             logger.info(f"User {user_id} approved by {admin_name}")
@@ -188,23 +193,23 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         except Exception as e:
             logger.error(f"Error approving user {user_id}: {e}")
             await query.edit_message_caption(
-                caption=query.message.caption + f"\n\n❌ Error: {str(e)}"
+                caption=query.message.caption + f"\n\n❌ Помилка: {str(e)}"
             )
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ There was an error processing your approval. Please contact support.",
+                text="❌ Виникла помилка при обробці вашого запиту. Будь ласка, зверніться до служби підтримки.",
             )
 
     else:  # reject
         # Notify user
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"❌ Unfortunately, your request has been rejected by {admin_name}.",
+            text=f"❌ На жаль, ваш запит відхилено адміністратором {admin_name}.",
         )
 
         # Update admin message
         await query.edit_message_caption(
-            caption=query.message.caption + f"\n\n❌ REJECTED by {admin_name}"
+            caption=query.message.caption + f"\n\n❌ ВІДХИЛЕНО {admin_name}"
         )
 
         logger.info(f"User {user_id} rejected by {admin_name}")
@@ -216,7 +221,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the conversation."""
     await update.message.reply_text(
-        "❌ Verification process cancelled. Use /start to begin again."
+        "❌ Процес верифікації скасовано. Використайте /start, щоб розпочати знову."
     )
     return ConversationHandler.END
 
@@ -242,12 +247,12 @@ async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await context.bot.send_message(
                     chat_id=chat.id,
                     text=(
-                        f"✅ Bot has been added to this {chat.type}!\n\n"
-                        f"📋 Chat Information:\n"
-                        f"Title: {chat.title}\n"
+                        f"✅ Бот додано до цієї групи!\n\n"
+                        f"📋 Інформація про чат:\n"
+                        f"Назва: {chat.title}\n"
                         f"Chat ID: `{chat.id}`\n"
-                        f"Type: {chat.type}\n\n"
-                        f"Use this Chat ID in your .env configuration."
+                        f"Тип: {chat.type}\n\n"
+                        f"Використовуйте цей Chat ID у вашій .env конфігурації."
                     ),
                     parse_mode="Markdown"
                 )
