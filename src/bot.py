@@ -40,6 +40,9 @@ PHONE_NUMBER, DOCUMENT, APARTMENT_NUMBER, AREA, DOCUMENT_TYPE, CONFIRM_DATA, WAI
 # Store pending requests
 pending_requests: Dict[int, dict] = {}
 
+# Store admin rejection states (waiting for reason)
+admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
+
 
 async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]:
     """Parse document image using OpenAI Vision API."""
@@ -403,21 +406,62 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
 
     else:  # reject
-        # Notify user
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"❌ На жаль, ваш запит відхилено адміністратором {admin_name}.",
-        )
+        # Ask admin for rejection reason
+        admin_rejection_state[query.message.message_id] = user_id
 
-        # Update admin message
         await query.edit_message_caption(
-            caption=query.message.caption + f"\n\n❌ ВІДХИЛЕНО {admin_name}"
+            caption=query.message.caption + f"\n\n⏳ {admin_name} відхиляє запит...\n\nБудь ласка, відповідайте на це повідомлення з причиною відхилення."
         )
 
-        logger.info(f"User {user_id} rejected by {admin_name}")
+        logger.info(f"Admin {admin_name} initiated rejection for user {user_id}, waiting for reason")
 
-    # Remove from pending
+
+async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle rejection reason from admin."""
+    # Check if this is a reply to a message waiting for rejection reason
+    if not update.message.reply_to_message:
+        return
+
+    message_id = update.message.reply_to_message.message_id
+
+    if message_id not in admin_rejection_state:
+        return
+
+    user_id = admin_rejection_state[message_id]
+    rejection_reason = update.message.text.strip()
+    admin_name = update.message.from_user.first_name
+
+    if user_id not in pending_requests:
+        await update.message.reply_text("❌ Запит застарів або вже оброблений.")
+        del admin_rejection_state[message_id]
+        return
+
+    # Notify user with rejection reason
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"❌ На жаль, ваш запит відхилено адміністратором {admin_name}.\n\n"
+            f"Причина: {rejection_reason}"
+        ),
+    )
+
+    # Update admin message
+    try:
+        await context.bot.edit_message_caption(
+            chat_id=update.message.chat_id,
+            message_id=message_id,
+            caption=update.message.reply_to_message.caption + f"\n\n❌ ВІДХИЛЕНО {admin_name}\n📝 Причина: {rejection_reason}"
+        )
+    except Exception as e:
+        logger.error(f"Error updating admin message: {e}")
+
+    await update.message.reply_text(f"✅ Запит відхилено. Користувач отримав повідомлення з причиною.")
+
+    logger.info(f"User {user_id} rejected by {admin_name} with reason: {rejection_reason}")
+
+    # Clean up
     del pending_requests[user_id]
+    del admin_rejection_state[message_id]
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -512,6 +556,14 @@ def main() -> None:
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(approval_callback))
     application.add_handler(ChatMemberHandler(chat_member_updated, ChatMemberHandler.MY_CHAT_MEMBER))
+
+    # Handler for rejection reason in admin group (must be after conv_handler)
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & filters.REPLY & ~filters.COMMAND,
+            handle_rejection_reason
+        )
+    )
 
     # Start bot
     logger.info("Bot started")
