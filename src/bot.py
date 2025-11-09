@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_GROUP_ID = os.getenv("ADMIN_GROUP_ID")
-PRIVATE_GROUP_ID = os.getenv("PRIVATE_GROUP_ID")
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
+PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID"))
 
 # Conversation states
 PHONE_NUMBER, DOCUMENT, WAITING_APPROVAL = range(3)
@@ -116,19 +116,25 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     # Send to admin group
-    await context.bot.send_photo(
-        chat_id=ADMIN_GROUP_ID,
-        photo=photo.file_id,
-        caption=(
-            "🆕 New Access Request\n\n"
-            f"👤 Name: {first_name} {last_name}\n"
-            f"📱 Phone: {phone_number}\n"
-            f"🆔 User ID: {user_id}\n"
-            f"👥 Username: @{username if username != 'N/A' else 'None'}\n\n"
-            "Please review the document and approve or reject."
-        ),
-        reply_markup=reply_markup,
-    )
+    logger.info(f"Sending request to admin group {ADMIN_GROUP_ID} for user {user_id}")
+    try:
+        await context.bot.send_photo(
+            chat_id=ADMIN_GROUP_ID,
+            photo=photo.file_id,
+            caption=(
+                "🆕 New Access Request\n\n"
+                f"👤 Name: {first_name} {last_name}\n"
+                f"📱 Phone: {phone_number}\n"
+                f"🆔 User ID: {user_id}\n"
+                f"👥 Username: @{username if username != 'N/A' else 'None'}\n\n"
+                "Please review the document and approve or reject."
+            ),
+            reply_markup=reply_markup,
+        )
+        logger.info(f"Successfully sent request to admin group for user {user_id}")
+    except Exception as e:
+        logger.error(f"Error sending to admin group: {e}")
+        raise
 
     await update.message.reply_text(
         "✅ Your request has been submitted!\n\n"
@@ -262,6 +268,8 @@ def main() -> None:
     if not PRIVATE_GROUP_ID:
         logger.error("PRIVATE_GROUP_ID not found in environment variables")
         return
+
+    logger.info(f"Configuration loaded - Admin Group: {ADMIN_GROUP_ID}, Private Group: {PRIVATE_GROUP_ID}")
 
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
