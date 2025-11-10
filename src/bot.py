@@ -334,9 +334,9 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         # Store phone number
         context.user_data["phone_number"] = contact.phone_number
         context.user_data["user_id"] = update.effective_user.id
-        context.user_data["username"] = update.effective_user.username
-        context.user_data["first_name"] = update.effective_user.first_name
-        context.user_data["last_name"] = update.effective_user.last_name
+        context.user_data["username"] = update.effective_user.username or ""
+        context.user_data["first_name"] = update.effective_user.first_name or ""
+        context.user_data["last_name"] = update.effective_user.last_name or ""
 
         # Ask if owner or roommate
         keyboard = [
@@ -433,7 +433,7 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
     # Send approval request to owner
     roommate_name = f"{context.user_data['first_name']} {context.user_data.get('last_name', '')}"
     roommate_phone = context.user_data["phone_number"]
-    roommate_username = context.user_data.get("username", "Немає")
+    roommate_username = context.user_data.get("username", "")
     roommate_user_id = context.user_data['user_id']
 
     # Create approval keyboard
@@ -467,7 +467,8 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
                 f"👥 Запит на додавання співмешканця/орендаря\n\n"
                 f"👤 Ім'я: {roommate_name}\n"
                 f"📱 Телефон: {roommate_phone}\n"
-                f"👥 Username: @{roommate_username if roommate_username != 'Немає' else 'Немає'}\n\n"
+                f"{'👥 Username: @' + roommate_username if roommate_username else ''}"
+                f"{chr(10) if roommate_username else ''}"
                 f"🏠 Квартира: {owner_data.get('Номер квартири')}\n\n"
                 "Ця людина хоче приєднатися як співмешканець/орендар. Підтверджуєте?"
             ),
@@ -674,7 +675,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     user_id = context.user_data["user_id"]
     phone_number = context.user_data["phone_number"]
-    username = context.user_data.get("username", "N/A")
+    username = context.user_data.get("username", "")
     first_name = context.user_data.get("first_name", "")
     last_name = context.user_data.get("last_name", "")
     apartment_number = context.user_data.get("apartment_number", "")
@@ -715,7 +716,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 f"👤 Ім'я: {first_name} {last_name}\n"
                 f"📱 Телефон: {phone_number}\n"
                 f"🆔 User ID: {user_id}\n"
-                f"👥 Username: @{username if username != 'N/A' else 'Немає'}\n\n"
+                f"{'👥 Username: @' + username + chr(10) if username else ''}"
                 f"🏠 Номер квартири: {apartment_number}\n"
                 f"📐 Площа: {area} м²\n"
                 f"📄 Тип документа: {document_type}\n\n"
