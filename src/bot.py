@@ -201,8 +201,8 @@ def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_numb
             sheet = spreadsheet.add_worksheet(title=ROOMMATES_WORKSHEET_NAME, rows=100, cols=10)
             # Add headers
             sheet.append_row([
-                "Дата/час", "Telegram User ID", "Ім'я співмешканця/орендаря", "Прізвище співмешканця/орендаря", "Username співмешканця/орендаря",
-                "Телефон співмешканця/орендаря", "Ім'я власника", "Телефон власника", "Номер квартири"
+                "Дата/час", "Telegram User ID", "Ім'я", "Прізвище", "Username",
+                "Телефон", "Ім'я власника", "Телефон власника", "Номер квартири"
             ])
 
         # Prepare row data
@@ -338,10 +338,10 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data["first_name"] = update.effective_user.first_name or ""
         context.user_data["last_name"] = update.effective_user.last_name or ""
 
-        # Ask if owner or roommate
+        # Ask if owner or other user
         keyboard = [
             [KeyboardButton("🏠 Я власник квартири")],
-            [KeyboardButton("👥 Я співмешканець")],
+            [KeyboardButton("👥 Інший користувач")],
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
@@ -372,12 +372,17 @@ async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
             "Головне, щоб було видно:\n"
             "• Номер приміщення\n"
-            "• Площу"
+            "• Площу\n\n"
+            "ℹ️ Які дані ми збираємо:\n"
+            "• Номер телефону (для пошуку співмешканців)\n"
+            "• Telegram username (для пошуку співмешканців)\n"
+            "• Номер квартири та площу (для голосування)\n\n"
+            "🔒 Ваші дані не передаються третім особам і використовуються виключно для роботи бота та розуміння загальної площі власників для можливості голосування."
         )
 
         return DOCUMENT
 
-    elif "співмешканець" in user_type.lower():
+    elif "інший" in user_type.lower() or "користувач" in user_type.lower():
         # Roommate flow - ask for owner's phone
         context.user_data["is_owner"] = False
 
@@ -464,13 +469,13 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
         await context.bot.send_message(
             chat_id=int(owner_user_id),
             text=(
-                f"👥 Запит на додавання співмешканця/орендаря\n\n"
+                f"👥 Запит на додавання користувача\n\n"
                 f"👤 Ім'я: {roommate_name}\n"
                 f"📱 Телефон: {roommate_phone}\n"
                 f"{'👥 Username: @' + roommate_username if roommate_username else ''}"
                 f"{chr(10) if roommate_username else ''}"
                 f"🏠 Квартира: {owner_data.get('Номер квартири')}\n\n"
-                "Ця людина хоче приєднатися як співмешканець/орендар. Підтверджуєте?"
+                "Ця людина хоче приєднатися до групи. Підтверджуєте?"
             ),
             reply_markup=reply_markup
         )
@@ -767,7 +772,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(
                 chat_id=roommate_user_id,
                 text=(
-                    f"🎉 Вітаємо! Власник {owner_name} підтвердив вас як співмешканця/орендаря.\n\n"
+                    f"🎉 Вітаємо! Власник {owner_name} підтвердив ваш запит.\n\n"
                     f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
                 ),
             )
@@ -795,7 +800,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
         # Notify roommate
         await context.bot.send_message(
             chat_id=roommate_user_id,
-            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання як співмешканця/орендаря."
+            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання."
         )
 
         # Update owner's message
