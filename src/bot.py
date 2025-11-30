@@ -528,11 +528,13 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if photo:
         context.user_data["document_file_id"] = photo.file_id
+        context.user_data["document_kind"] = "photo"
         file = await context.bot.get_file(photo.file_id)
         image_source = file.file_path
     elif document:
         mime_type = document.mime_type or ""
         context.user_data["document_file_id"] = document.file_id
+        context.user_data["document_kind"] = "document"
         file = await context.bot.get_file(document.file_id)
 
         if mime_type.startswith("image/"):
@@ -761,6 +763,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     area = context.user_data.get("area", "")
     document_type = context.user_data.get("document_type", "")
     photo_file_id = context.user_data.get("document_file_id", "")
+    document_kind = context.user_data.get("document_kind", "photo")
 
     # Store request
     pending_requests[user_id] = {
@@ -787,22 +790,40 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Send to admin group
     logger.info(f"Sending request to admin group {ADMIN_GROUP_ID} for user {user_id}")
     try:
-        await context.bot.send_photo(
-            chat_id=ADMIN_GROUP_ID,
-            photo=photo_file_id,
-            caption=(
-                "🆕 Новий запит на доступ\n\n"
-                f"👤 Ім'я: {first_name} {last_name}\n"
-                f"📱 Телефон: {phone_number}\n"
-                f"🆔 User ID: {user_id}\n"
-                f"{'👥 Username: @' + username + chr(10) if username else ''}"
-                f"🏠 Номер квартири: {apartment_number}\n"
-                f"📐 Площа: {area} м²\n"
-                f"📄 Тип документа: {document_type}\n\n"
-                "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
-            ),
-            reply_markup=reply_markup,
-        )
+        if document_kind == "photo":
+            await context.bot.send_photo(
+                chat_id=ADMIN_GROUP_ID,
+                photo=photo_file_id,
+                caption=(
+                    "🆕 Новий запит на доступ\n\n"
+                    f"👤 Ім'я: {first_name} {last_name}\n"
+                    f"📱 Телефон: {phone_number}\n"
+                    f"🆔 User ID: {user_id}\n"
+                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
+                    f"🏠 Номер квартири: {apartment_number}\n"
+                    f"📐 Площа: {area} м²\n"
+                    f"📄 Тип документа: {document_type}\n\n"
+                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
+                ),
+                reply_markup=reply_markup,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=ADMIN_GROUP_ID,
+                document=photo_file_id,
+                caption=(
+                    "🆕 Новий запит на доступ\n\n"
+                    f"👤 Ім'я: {first_name} {last_name}\n"
+                    f"📱 Телефон: {phone_number}\n"
+                    f"🆔 User ID: {user_id}\n"
+                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
+                    f"🏠 Номер квартири: {apartment_number}\n"
+                    f"📐 Площа: {area} м²\n"
+                    f"📄 Тип документа: {document_type}\n\n"
+                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
+                ),
+                reply_markup=reply_markup,
+            )
         logger.info(f"Successfully sent request to admin group for user {user_id}")
     except Exception as e:
         logger.error(f"Error sending to admin group: {e}")

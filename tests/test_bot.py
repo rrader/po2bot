@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from unittest.mock import AsyncMock
 
 os.environ.setdefault("ADMIN_GROUP_ID", "0")
 os.environ.setdefault("PRIVATE_GROUP_ID", "0")
@@ -109,3 +110,58 @@ def test_normalize_phone_variations():
     assert bot.normalize_phone("38050123456789") == "380501234567"
     assert bot.normalize_phone("invalid") == ""
     assert bot.normalize_phone("") == ""
+
+
+class _FakeTelegramMessage:
+    def __init__(self):
+        self.replies = []
+
+    async def reply_text(self, text, *_, **__):
+        self.replies.append(text)
+
+
+class _FakeUpdate:
+    def __init__(self):
+        self.message = _FakeTelegramMessage()
+
+
+class _FakeContext:
+    def __init__(self, user_data, bot_client):
+        self.user_data = user_data
+        self.bot = bot_client
+
+
+@pytest.mark.asyncio
+async def test_send_to_admin_uses_document_for_non_photo(monkeypatch):
+    # Prepare fake bot methods
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "send_photo": AsyncMock(),
+            "send_document": AsyncMock(),
+        },
+    )()
+
+    user_data = {
+        "user_id": 1,
+        "phone_number": "+123",
+        "username": "testuser",
+        "first_name": "Test",
+        "last_name": "User",
+        "apartment_number": "12",
+        "area": "34",
+        "document_type": "PDF",
+        "document_file_id": "file-id",
+        "document_kind": "document",
+    }
+
+    update = _FakeUpdate()
+    context = _FakeContext(user_data=user_data, bot_client=fake_bot)
+
+    result_state = await bot.send_to_admin(update, context)
+
+    assert result_state == bot.WAITING_APPROVAL
+    fake_bot.send_photo.assert_not_awaited()
+    fake_bot.send_document.assert_awaited_once()
+    assert update.message.replies
