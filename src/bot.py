@@ -19,6 +19,7 @@ from telegram.ext import (
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pypdfium2 as pdfium
+from PIL import Image
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -551,6 +552,9 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 renderer = page.render(scale=2)
                 pil_image = renderer.to_pil()
 
+                if not pil_image:
+                    raise RuntimeError("Pillow is required to convert PDF pages to images")
+
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_img:
                     pil_image.save(temp_img.name, format="JPEG")
                     temp_img.seek(0)
@@ -560,6 +564,13 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 image_source = base64.b64encode(image_bytes).decode("utf-8")
                 is_base64 = True
                 mime_type = "image/jpeg"
+            except Exception as e:
+                logger.error(f"Failed to convert PDF to image: {e}")
+                await update.message.reply_text(
+                    "❌ Не вдалося обробити PDF. Переконайтеся, що файл не пошкоджений, "
+                    "або спробуйте надіслати фото договору."
+                )
+                return DOCUMENT
             finally:
                 try:
                     os.remove(temp_pdf.name)
