@@ -1072,10 +1072,10 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_owner_phone_received),
             ],
             DOCUMENT: [
-                MessageHandler(filters.PHOTO, document_received),
+                MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
             ],
             APARTMENT_NUMBER: [
-                MessageHandler(filters.PHOTO, document_received),
+                MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apartment_number_received),
             ],
             AREA: [
