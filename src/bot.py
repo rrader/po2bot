@@ -548,7 +548,8 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             try:
                 pdf_doc = pdfium.PdfDocument(temp_pdf.name)
                 page = pdf_doc[0]
-                pil_image = page.render_topil(scale=2)
+                renderer = page.render(scale=2)
+                pil_image = renderer.to_pil()
 
                 with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_img:
                     pil_image.save(temp_img.name, format="JPEG")
