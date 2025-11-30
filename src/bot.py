@@ -1,8 +1,10 @@
-import os
-import logging
+import base64
 import json
-from typing import Dict, Optional
+import logging
+import os
+import tempfile
 from datetime import datetime
+from typing import Dict, Optional
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,10 +16,12 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from dotenv import load_dotenv
-from openai import OpenAI
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import pypdfium2 as pdfium
+from PIL import Image
+from dotenv import load_dotenv
+from openai import OpenAI
 
 # Load environment variables
 load_dotenv()
@@ -228,13 +232,19 @@ def add_roommate_to_sheets(roommate_data: dict, owner_data: dict, apartment_numb
         return False
 
 
-async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]:
+async def parse_document_with_openai(
+    image_source: str, *, is_base64: bool = False, mime_type: str = "image/jpeg"
+) -> Optional[Dict[str, str]]:
     """Parse document image using OpenAI Vision API."""
     if not openai_client:
         logger.error("OpenAI client not initialized")
         return None
 
     try:
+        image_url = (
+            f"data:{mime_type};base64,{image_source}" if is_base64 else image_source
+        )
+
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
@@ -250,12 +260,7 @@ async def parse_document_with_openai(image_url: str) -> Optional[Dict[str, str]]
 
 Якщо якась інформація не розбірлива або відсутня, вкажи null для цього поля."""
                         },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_url
-                            }
-                        }
+                        {"type": "image_url", "image_url": {"url": image_url}}
                     ]
                 }
             ],
@@ -368,7 +373,7 @@ async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["is_owner"] = True
 
         await update.message.reply_text(
-            "Тепер, будь ласка, завантажте фото договору інвестування/купівлі або витягу з реєстру.\n\n"
+            "Тепер, будь ласка, завантажте фото або PDF договору інвестування/купівлі чи витягу з реєстру.\n\n"
             "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
             "Головне, щоб було видно:\n"
             "• Номер приміщення\n"
@@ -506,28 +511,99 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
 
 async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle document upload and try to parse it with OpenAI."""
-    if not update.message.photo:
+    message = update.message
+    document = message.document
+    photo = message.photo[-1] if message.photo else None
+
+    if not (photo or document):
         await update.message.reply_text(
-            "❌ Будь ласка, надішліть фото договору або витягу з реєстру.\n\n"
-            "Не забудьте заблюрити особисті дані, але залишити видимими номер приміщення та площу."
+            "❌ Будь ласка, завантажте фото або PDF договору/витягу. "
+            "Файли інших типів поки не підтримуємо."
         )
         return DOCUMENT
 
-    # Get the largest photo
-    photo = update.message.photo[-1]
-    context.user_data["document_file_id"] = photo.file_id
+    image_source = None
+    is_base64 = False
+    mime_type = "image/jpeg"
 
-    # Show processing message
+    if photo:
+        context.user_data["document_file_id"] = photo.file_id
+        context.user_data["document_kind"] = "photo"
+        file = await context.bot.get_file(photo.file_id)
+        image_source = file.file_path
+    elif document:
+        mime_type = document.mime_type or ""
+        context.user_data["document_file_id"] = document.file_id
+        context.user_data["document_kind"] = "document"
+        file = await context.bot.get_file(document.file_id)
+
+        if mime_type.startswith("image/"):
+            image_source = file.file_path
+        elif (
+            mime_type == "application/pdf"
+            or (document.file_name and document.file_name.lower().endswith(".pdf"))
+        ):
+            temp_img_path = None
+
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_pdf:
+                await file.download_to_drive(custom_path=temp_pdf.name)
+
+            try:
+                pdf_doc = pdfium.PdfDocument(temp_pdf.name)
+                page = pdf_doc[0]
+                renderer = page.render(scale=2)
+                pil_image = renderer.to_pil()
+
+                if not pil_image:
+                    raise RuntimeError("Pillow is required to convert PDF pages to images")
+
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_img:
+                    pil_image.save(temp_img.name, format="JPEG")
+                    temp_img.seek(0)
+                    image_bytes = temp_img.read()
+                    temp_img_path = temp_img.name
+
+                image_source = base64.b64encode(image_bytes).decode("utf-8")
+                is_base64 = True
+                mime_type = "image/jpeg"
+            except Exception as e:
+                logger.error(f"Failed to convert PDF to image: {e}")
+                await update.message.reply_text(
+                    "❌ Не вдалося обробити PDF. Переконайтеся, що файл не пошкоджений, "
+                    "або спробуйте надіслати фото договору."
+                )
+                return DOCUMENT
+            finally:
+                try:
+                    os.remove(temp_pdf.name)
+                except OSError:
+                    logger.warning("Failed to remove temporary PDF file")
+
+                if temp_img_path:
+                    try:
+                        os.remove(temp_img_path)
+                    except OSError:
+                        logger.warning("Failed to remove temporary image file")
+        else:
+            await update.message.reply_text(
+                "❌ Ми підтримуємо лише зображення (JPG, PNG, HEIC тощо) та PDF. "
+                "Завантажте фото договору або PDF-версію, будь ласка."
+            )
+            return DOCUMENT
+
+    if not image_source:
+        await update.message.reply_text(
+            "❌ Не вдалося обробити файл. Спробуйте інший формат (JPG, PNG, PDF)."
+        )
+        return DOCUMENT
+
     processing_msg = await update.message.reply_text(
         "⏳ Обробляю документ, зачекайте..."
     )
 
-    # Get photo URL for OpenAI
-    file = await context.bot.get_file(photo.file_id)
-    image_url = file.file_path
-
-    # Try to parse document with OpenAI
-    parsed_data = await parse_document_with_openai(image_url)
+    parsed_data = await parse_document_with_openai(
+        image_source, is_base64=is_base64, mime_type=mime_type
+    )
 
     # Delete processing message
     await processing_msg.delete()
@@ -583,7 +659,7 @@ async def apartment_number_received(update: Update, context: ContextTypes.DEFAUL
     # Check if user wants to upload new photo
     if "завантажити" in user_input.lower() or "📷" in user_input:
         await update.message.reply_text(
-            "Добре! Завантажте нове фото договору інвестування/купівлі або витягу з реєстру.\n\n"
+            "Добре! Завантажте нове фото або PDF договору інвестування/купівлі чи витягу з реєстру.\n\n"
             "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
             "Головне, щоб було видно:\n"
             "• Номер приміщення\n"
@@ -687,6 +763,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     area = context.user_data.get("area", "")
     document_type = context.user_data.get("document_type", "")
     photo_file_id = context.user_data.get("document_file_id", "")
+    document_kind = context.user_data.get("document_kind", "photo")
 
     # Store request
     pending_requests[user_id] = {
@@ -713,22 +790,40 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Send to admin group
     logger.info(f"Sending request to admin group {ADMIN_GROUP_ID} for user {user_id}")
     try:
-        await context.bot.send_photo(
-            chat_id=ADMIN_GROUP_ID,
-            photo=photo_file_id,
-            caption=(
-                "🆕 Новий запит на доступ\n\n"
-                f"👤 Ім'я: {first_name} {last_name}\n"
-                f"📱 Телефон: {phone_number}\n"
-                f"🆔 User ID: {user_id}\n"
-                f"{'👥 Username: @' + username + chr(10) if username else ''}"
-                f"🏠 Номер квартири: {apartment_number}\n"
-                f"📐 Площа: {area} м²\n"
-                f"📄 Тип документа: {document_type}\n\n"
-                "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
-            ),
-            reply_markup=reply_markup,
-        )
+        if document_kind == "photo":
+            await context.bot.send_photo(
+                chat_id=ADMIN_GROUP_ID,
+                photo=photo_file_id,
+                caption=(
+                    "🆕 Новий запит на доступ\n\n"
+                    f"👤 Ім'я: {first_name} {last_name}\n"
+                    f"📱 Телефон: {phone_number}\n"
+                    f"🆔 User ID: {user_id}\n"
+                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
+                    f"🏠 Номер квартири: {apartment_number}\n"
+                    f"📐 Площа: {area} м²\n"
+                    f"📄 Тип документа: {document_type}\n\n"
+                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
+                ),
+                reply_markup=reply_markup,
+            )
+        else:
+            await context.bot.send_document(
+                chat_id=ADMIN_GROUP_ID,
+                document=photo_file_id,
+                caption=(
+                    "🆕 Новий запит на доступ\n\n"
+                    f"👤 Ім'я: {first_name} {last_name}\n"
+                    f"📱 Телефон: {phone_number}\n"
+                    f"🆔 User ID: {user_id}\n"
+                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
+                    f"🏠 Номер квартири: {apartment_number}\n"
+                    f"📐 Площа: {area} м²\n"
+                    f"📄 Тип документа: {document_type}\n\n"
+                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
+                ),
+                reply_markup=reply_markup,
+            )
         logger.info(f"Successfully sent request to admin group for user {user_id}")
     except Exception as e:
         logger.error(f"Error sending to admin group: {e}")
@@ -1010,10 +1105,10 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_owner_phone_received),
             ],
             DOCUMENT: [
-                MessageHandler(filters.PHOTO, document_received),
+                MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
             ],
             APARTMENT_NUMBER: [
-                MessageHandler(filters.PHOTO, document_received),
+                MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apartment_number_received),
             ],
             AREA: [
