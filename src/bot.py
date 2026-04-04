@@ -5,7 +5,7 @@ import os
 import tempfile
 from datetime import datetime
 from typing import Dict, Optional
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -152,6 +152,57 @@ def find_owner_by_phone_or_username(search_value: str) -> Optional[Dict[str, any
     except Exception as e:
         logger.error(f"Error searching for owner: {e}")
         return None
+
+
+def find_registered_by_phone(phone: str) -> Optional[Dict[str, any]]:
+    """Check if a phone number is already registered in owners or roommates sheet.
+
+    Returns the first matching record (owners sheet takes priority), or None.
+    """
+    if not google_sheets_client:
+        return None
+
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return None
+
+    try:
+        spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
+
+        # Check owners sheet
+        try:
+            sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+            all_values = sheet.get_all_values()
+            if all_values and len(all_values) >= 3:
+                headers = all_values[1]
+                for row in all_values[2:]:
+                    if row:
+                        record = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
+                        if normalize_phone(str(record.get("Телефон", ""))) == normalized:
+                            logger.info(f"Phone {phone} found in owners sheet")
+                            return record
+        except Exception as e:
+            logger.warning(f"Error checking owners sheet: {e}")
+
+        # Check roommates sheet
+        try:
+            sheet = spreadsheet.worksheet(ROOMMATES_WORKSHEET_NAME)
+            all_values = sheet.get_all_values()
+            if all_values and len(all_values) >= 2:
+                headers = all_values[0]
+                for row in all_values[1:]:
+                    if row:
+                        record = {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))}
+                        if normalize_phone(str(record.get("Телефон", ""))) == normalized:
+                            logger.info(f"Phone {phone} found in roommates sheet")
+                            return record
+        except Exception as e:
+            logger.warning(f"Error checking roommates sheet: {e}")
+
+    except Exception as e:
+        logger.error(f"Error in find_registered_by_phone: {e}")
+
+    return None
 
 
 def add_to_google_sheets(user_data: dict, admin_name: str, worksheet_name: str = None) -> bool:
@@ -336,12 +387,30 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
     contact = update.message.contact
 
     if contact and contact.user_id == update.effective_user.id:
-        # Store phone number
+        # Store phone number and user info
         context.user_data["phone_number"] = contact.phone_number
         context.user_data["user_id"] = update.effective_user.id
         context.user_data["username"] = update.effective_user.username or ""
         context.user_data["first_name"] = update.effective_user.first_name or ""
         context.user_data["last_name"] = update.effective_user.last_name or ""
+
+        # Check if already registered (owner or co-owner)
+        existing = find_registered_by_phone(contact.phone_number)
+        if existing:
+            context.user_data["is_owner"] = True
+            context.user_data["already_registered"] = True
+            keyboard = [
+                [KeyboardButton("➕ Додати ще одну квартиру")],
+                [KeyboardButton("❌ Скасувати")],
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            await update.message.reply_text(
+                f"✅ Номер телефону отримано: {contact.phone_number}\n\n"
+                "Цей номер вже зареєстрований у системі.\n"
+                "Бажаєте додати ще одну квартиру до свого профілю?",
+                reply_markup=reply_markup,
+            )
+            return USER_TYPE
 
         # Ask if owner or other user
         keyboard = [
@@ -364,27 +433,41 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
         return PHONE_NUMBER
 
 
+DOCUMENT_PROMPT = (
+    "Тепер, будь ласка, завантажте фото або PDF договору інвестування/купівлі чи витягу з реєстру.\n\n"
+    "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
+    "Головне, щоб було видно:\n"
+    "• Номер приміщення\n"
+    "• Площу\n\n"
+    "ℹ️ Які дані ми збираємо:\n"
+    "• Номер телефону (для пошуку співмешканців)\n"
+    "• Telegram username (для пошуку співмешканців)\n"
+    "• Номер квартири та площу (для голосування)\n\n"
+    "🔒 Ваші дані не передаються третім особам і використовуються виключно для роботи бота та розуміння загальної площі власників для можливості голосування."
+)
+
+
 async def user_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle user type selection."""
     user_type = update.message.text.strip()
 
-    if "власник" in user_type.lower():
+    if "додати ще одну квартиру" in user_type.lower():
+        # Already-registered user adding another apartment — skip to document upload
+        context.user_data["is_owner"] = True
+        await update.message.reply_text(DOCUMENT_PROMPT, reply_markup=ReplyKeyboardRemove())
+        return DOCUMENT
+
+    elif "скасувати" in user_type.lower():
+        await update.message.reply_text(
+            "Скасовано. Використайте /start щоб почати спочатку.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
+    elif "власник" in user_type.lower():
         # Owner flow - ask for document
         context.user_data["is_owner"] = True
-
-        await update.message.reply_text(
-            "Тепер, будь ласка, завантажте фото або PDF договору інвестування/купівлі чи витягу з реєстру.\n\n"
-            "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
-            "Головне, щоб було видно:\n"
-            "• Номер приміщення\n"
-            "• Площу\n\n"
-            "ℹ️ Які дані ми збираємо:\n"
-            "• Номер телефону (для пошуку співмешканців)\n"
-            "• Telegram username (для пошуку співмешканців)\n"
-            "• Номер квартири та площу (для голосування)\n\n"
-            "🔒 Ваші дані не передаються третім особам і використовуються виключно для роботи бота та розуміння загальної площі власників для можливості голосування."
-        )
-
+        await update.message.reply_text(DOCUMENT_PROMPT, reply_markup=ReplyKeyboardRemove())
         return DOCUMENT
 
     elif "інший" in user_type.lower() or "користувач" in user_type.lower():
@@ -787,6 +870,20 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
+    already_registered = context.user_data.get("already_registered", False)
+    header = "➕ Додаткова квартира вже зареєстрованого користувача" if already_registered else "🆕 Новий запит на доступ"
+    admin_caption = (
+        f"{header}\n\n"
+        f"👤 Ім'я: {first_name} {last_name}\n"
+        f"📱 Телефон: {phone_number}\n"
+        f"🆔 User ID: {user_id}\n"
+        f"{'👥 Username: @' + username + chr(10) if username else ''}"
+        f"🏠 Номер квартири: {apartment_number}\n"
+        f"📐 Площа: {area} м²\n"
+        f"📄 Тип документа: {document_type}\n\n"
+        "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
+    )
+
     # Send to admin group
     logger.info(f"Sending request to admin group {ADMIN_GROUP_ID} for user {user_id}")
     try:
@@ -794,34 +891,14 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             await context.bot.send_photo(
                 chat_id=ADMIN_GROUP_ID,
                 photo=photo_file_id,
-                caption=(
-                    "🆕 Новий запит на доступ\n\n"
-                    f"👤 Ім'я: {first_name} {last_name}\n"
-                    f"📱 Телефон: {phone_number}\n"
-                    f"🆔 User ID: {user_id}\n"
-                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
-                    f"🏠 Номер квартири: {apartment_number}\n"
-                    f"📐 Площа: {area} м²\n"
-                    f"📄 Тип документа: {document_type}\n\n"
-                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
-                ),
+                caption=admin_caption,
                 reply_markup=reply_markup,
             )
         else:
             await context.bot.send_document(
                 chat_id=ADMIN_GROUP_ID,
                 document=photo_file_id,
-                caption=(
-                    "🆕 Новий запит на доступ\n\n"
-                    f"👤 Ім'я: {first_name} {last_name}\n"
-                    f"📱 Телефон: {phone_number}\n"
-                    f"🆔 User ID: {user_id}\n"
-                    f"{'👥 Username: @' + username + chr(10) if username else ''}"
-                    f"🏠 Номер квартири: {apartment_number}\n"
-                    f"📐 Площа: {area} м²\n"
-                    f"📄 Тип документа: {document_type}\n\n"
-                    "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
-                ),
+                caption=admin_caption,
                 reply_markup=reply_markup,
             )
         logger.info(f"Successfully sent request to admin group for user {user_id}")
@@ -933,20 +1010,32 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if action == "approve":
         try:
-            # Invite user to private group
-            invite_link = await context.bot.create_chat_invite_link(
-                chat_id=PRIVATE_GROUP_ID,
-                member_limit=1,
-            )
+            # Check if user is already in the private group
+            already_in_group = False
+            try:
+                member = await context.bot.get_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=user_id)
+                already_in_group = member.status not in ("left", "kicked")
+            except Exception:
+                pass
 
-            # Notify user
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"🎉 Вітаємо! Ваш запит схвалено адміністратором {admin_name}.\n\n"
-                    f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
-                ),
-            )
+            if already_in_group:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"🎉 Ваш запит на нову квартиру схвалено адміністратором {admin_name}.\n\nВи вже є учасником приватної групи.",
+                )
+            else:
+                # Invite user to private group
+                invite_link = await context.bot.create_chat_invite_link(
+                    chat_id=PRIVATE_GROUP_ID,
+                    member_limit=1,
+                )
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"🎉 Вітаємо! Ваш запит схвалено адміністратором {admin_name}.\n\n"
+                        f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
+                    ),
+                )
 
             # Add to Google Sheets
             add_to_google_sheets(request_data, admin_name)
