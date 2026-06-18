@@ -375,6 +375,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await update.message.reply_text(
         f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації.\n\n"
+        "Іноді бот може тимчасово не відповідати. Якщо це сталося, скористайтеся командою /start, щоб почати спочатку.\n\n"
         "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче.",
         reply_markup=reply_markup,
     )
