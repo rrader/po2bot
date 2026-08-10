@@ -69,6 +69,11 @@ admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
 # Store roommate approval requests (waiting for owner confirmation)
 roommate_approval_state: Dict[int, dict] = {}  # {message_id: {roommate_user_id, owner_phone, etc}}
 
+DAH_INVITE_SUGGESTION = (
+    "\n\n🏠 Щоб скоріше створити ОСББ, також пропонуємо приєднатися до застосунку \"Дах\" для мешканців будинку:\n"
+    "http://app.dah.in.ua/oNCk"
+)
+
 
 def normalize_phone(phone: str) -> str:
     """Normalize phone number to format 380XXXXXXXXX."""
@@ -948,6 +953,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
                 text=(
                     f"🎉 Вітаємо! Власник {owner_name} підтвердив ваш запит.\n\n"
                     f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
+                    f"{DAH_INVITE_SUGGESTION}"
                 ),
             )
 
@@ -1023,7 +1029,11 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             if already_in_group:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🎉 Ваш запит на нову квартиру схвалено адміністратором {admin_name}.\n\nВи вже є учасником приватної групи.",
+                    text=(
+                        f"🎉 Ваш запит на нову квартиру схвалено адміністратором {admin_name}.\n\n"
+                        f"Ви вже є учасником приватної групи."
+                        f"{DAH_INVITE_SUGGESTION}"
+                    ),
                 )
             else:
                 # Invite user to private group
@@ -1036,6 +1046,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     text=(
                         f"🎉 Вітаємо! Ваш запит схвалено адміністратором {admin_name}.\n\n"
                         f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
+                        f"{DAH_INVITE_SUGGESTION}"
                     ),
                 )
 
