@@ -716,5 +716,74 @@ async def test_question_text_containing_admin_words_triggers_confirmation(tmp_pa
     assert "прямо сюди в чат" in up_fallback_btn.message.replies[0]
 
 
+@pytest.mark.asyncio
+async def test_reply_in_private_chat_triggers_admin_confirmation(tmp_path, monkeypatch):
+    """Verify that Telegram reply in private chat triggers confirmation and quotes context in admin group."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+    monkeypatch.setenv("ADMIN_GROUP_ID", "-100777")
+    monkeypatch.setenv("ADMIN_SUPPORT_THREAD_ID", "42")
+
+    sent_admin_messages = []
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "send_message": AsyncMock(
+                side_effect=lambda **kwargs: (
+                    sent_admin_messages.append(kwargs) or type("Msg", (), {"message_id": 999})()
+                )
+            ),
+        },
+    )()
+
+    up = _FakeUpdate()
+    up.effective_chat = type("Chat", (), {"id": 12345, "type": "private"})()
+    up.effective_user.id = 12345
+    up.effective_user.first_name = "Олена"
+    up.message.reply_to_message = type(
+        "OrigMsg", (), {"text": "Попереднє повідомлення від бота", "caption": None}
+    )()
+    up.message.text = "Уточніть деталі, будь ласка"
+
+    ctx = _FakeContext(user_data={}, bot_client=fake_bot)
+
+    # 1. handle_admin_reply_or_rejection must ignore private chat replies
+    await bot.handle_admin_reply_or_rejection(up, ctx)
+    assert len(up.message.replies) == 0
+
+    # 2. unhandled_private_message handles reply and preserves quote context
+    await bot.unhandled_private_message(up, ctx)
+    assert len(up.message.replies) == 1
+    assert "Надіслати це адмінам?" in up.message.replies[0]
+    assert ctx.user_data.get("pending_feedback_text") == "Уточніть деталі, будь ласка"
+    assert (
+        ctx.user_data.get("pending_feedback_reply_context")
+        == "Попереднє повідомлення від бота"
+    )
+
+    # 3. Sending feedback forwards quoted context to admin group
+    class _FakeCallbackQuery:
+        def __init__(self, data):
+            self.data = data
+            self.edited_text = None
+        async def answer(self): pass
+        async def edit_message_text(self, text): self.edited_text = text
+
+    up_cb = _FakeUpdate()
+    up_cb.effective_user.id = 12345
+    up_cb.effective_user.first_name = "Олена"
+    up_cb.callback_query = _FakeCallbackQuery("feedback_send")
+
+    await bot.handle_feedback_callback(up_cb, ctx)
+    assert up_cb.callback_query.edited_text == "Отримали, відповімо тут, у боті."
+    assert len(sent_admin_messages) == 1
+    admin_msg = sent_admin_messages[0]
+    assert "У відповідь на:" in admin_msg["text"]
+    assert "Попереднє повідомлення від бота" in admin_msg["text"]
+    assert "Уточніть деталі, будь ласка" in admin_msg["text"]
+
+
 
 

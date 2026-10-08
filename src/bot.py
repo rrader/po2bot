@@ -1658,6 +1658,8 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
     # Check if this is a reply to a message in the admin group
     if not update.message or not update.message.reply_to_message:
         return
+    if update.effective_chat and update.effective_chat.type == "private":
+        return
 
     message_id = update.message.reply_to_message.message_id
     rejection_dict = get_admin_rejection_state(context)
@@ -1861,6 +1863,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # Fallback / Informational handlers for unexpected input at each step
 # ============================================================================
 
+def extract_reply_context(update: Update) -> Optional[str]:
+    """Extract a clean short preview of the message being replied to, if any."""
+    if not update.message:
+        return None
+    reply_to = getattr(update.message, "reply_to_message", None)
+    if not reply_to:
+        return None
+    quoted = getattr(reply_to, "text", "") or getattr(reply_to, "caption", "") or ""
+    if not quoted:
+        return None
+    clean = quoted.strip()
+    return clean[:117] + "..." if len(clean) > 120 else clean
+
+
 async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle unexpected messages when waiting for contact."""
     text = (getattr(update.message, "text", "") or "").strip()
@@ -1876,6 +1892,11 @@ async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             # User wrote actual text while waiting for contact — treat it as feedback/question!
             context.user_data["pending_feedback_text"] = text
+            reply_ctx = extract_reply_context(update)
+            if reply_ctx:
+                context.user_data["pending_feedback_reply_context"] = reply_ctx
+            else:
+                context.user_data.pop("pending_feedback_reply_context", None)
             keyboard = [
                 [
                     InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
@@ -2013,6 +2034,11 @@ async def waiting_approval_message(update: Update, context: ContextTypes.DEFAULT
     if text:
         # User is asking something while waiting for approval — offer to send to admins
         context.user_data["pending_feedback_text"] = text
+        reply_ctx = extract_reply_context(update)
+        if reply_ctx:
+            context.user_data["pending_feedback_reply_context"] = reply_ctx
+        else:
+            context.user_data.pop("pending_feedback_reply_context", None)
         keyboard = [
             [
                 InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
@@ -2049,6 +2075,11 @@ async def waiting_owner_approval_message(update: Update, context: ContextTypes.D
     text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
     if text:
         context.user_data["pending_feedback_text"] = text
+        reply_ctx = extract_reply_context(update)
+        if reply_ctx:
+            context.user_data["pending_feedback_reply_context"] = reply_ctx
+        else:
+            context.user_data.pop("pending_feedback_reply_context", None)
         keyboard = [
             [
                 InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
@@ -2121,6 +2152,11 @@ async def unhandled_private_message(update: Update, context: ContextTypes.DEFAUL
 
     # Save pending feedback text in user_data
     context.user_data["pending_feedback_text"] = text
+    reply_ctx = extract_reply_context(update)
+    if reply_ctx:
+        context.user_data["pending_feedback_reply_context"] = reply_ctx
+    else:
+        context.user_data.pop("pending_feedback_reply_context", None)
 
     keyboard = [
         [
@@ -2145,6 +2181,7 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
 
     if query.data == "feedback_cancel":
         context.user_data.pop("pending_feedback_text", None)
+        context.user_data.pop("pending_feedback_reply_context", None)
         await query.edit_message_text(
             "Скасовано. Якщо ви хочете розпочати верифікацію — надішліть /start, "
             "або /help для отримання довідки."
@@ -2153,6 +2190,7 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
 
     if query.data == "feedback_send":
         text = context.user_data.pop("pending_feedback_text", None)
+        reply_context = context.user_data.pop("pending_feedback_reply_context", None)
         if not text:
             await query.edit_message_text("❌ Повідомлення застаріло. Напишіть нове запитання, якщо потрібно.")
             return
@@ -2185,12 +2223,14 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
         apartment_info = html.escape(raw_apartment_info)
         escaped_text = html.escape(text)
 
+        reply_quote_html = f"↩️ <b>У відповідь на:</b> <i>«{html.escape(reply_context)}»</i>\n\n" if reply_context else ""
         admin_html = (
             "✉️ <b>Питання до адмінів</b>\n\n"
             f"👤 <b>Ім'я:</b> {full_name}\n"
             f"👥 <b>@нік:</b> {username_str}\n"
             f"🏠 <b>Квартира:</b> {apartment_info}\n"
             f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+            f"{reply_quote_html}"
             f"💬 <b>Повідомлення:</b>\n{escaped_text}\n\n"
             "ℹ️ <i>Щоб відповісти користувачеві, зробіть Reply на це повідомлення.</i>"
         )
@@ -2211,12 +2251,14 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
                 )
             except Exception as html_err:
                 logger.warning(f"Failed to send HTML formatted support message ({html_err}), falling back to plain text")
+                reply_quote_plain = f"↩️ У відповідь на: «{reply_context}»\n\n" if reply_context else ""
                 plain_text = (
                     "✉️ Питання до адмінів\n\n"
                     f"👤 Ім'я: {raw_full_name}\n"
                     f"👥 @нік: {raw_username_str}\n"
                     f"🏠 Квартира: {raw_apartment_info}\n"
                     f"🆔 User ID: {user_id}\n\n"
+                    f"{reply_quote_plain}"
                     f"💬 Повідомлення:\n{text}\n\n"
                     "ℹ️ Щоб відповісти користувачеві, зробіть Reply на це повідомлення."
                 )
@@ -2381,7 +2423,7 @@ def build_application() -> Optional[Application]:
     # Handler for admin replies (response to user question or rejection reason) in admin group
     application.add_handler(
         MessageHandler(
-            filters.REPLY & ~filters.COMMAND,
+            ~filters.ChatType.PRIVATE & filters.REPLY & ~filters.COMMAND,
             handle_admin_reply_or_rejection,
         )
     )
