@@ -1,4 +1,5 @@
 import base64
+import html
 import json
 import logging
 import os
@@ -2152,18 +2153,23 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
             return
 
         name_parts = [user.first_name, user.last_name]
-        full_name = " ".join(p for p in name_parts if p) or "Без імені"
-        username_str = f"@{user.username}" if user.username else "немає"
-        apartment_info = get_user_apartment_info(user_id, context)
+        raw_full_name = " ".join(p for p in name_parts if p) or "Без імені"
+        raw_username_str = f"@{user.username}" if user.username else "немає"
+        raw_apartment_info = get_user_apartment_info(user_id, context)
 
-        admin_text = (
-            "✉️ *Питання до адмінів*\n\n"
-            f"👤 *Ім'я:* {full_name}\n"
-            f"👥 *@нік:* {username_str}\n"
-            f"🏠 *Квартира:* {apartment_info}\n"
-            f"🆔 *User ID:* `{user_id}`\n\n"
-            f"💬 *Повідомлення:*\n{text}\n\n"
-            "ℹ️ _Щоб відповісти користувачеві, зробіть Reply на це повідомлення._"
+        full_name = html.escape(raw_full_name)
+        username_str = html.escape(raw_username_str)
+        apartment_info = html.escape(raw_apartment_info)
+        escaped_text = html.escape(text)
+
+        admin_html = (
+            "✉️ <b>Питання до адмінів</b>\n\n"
+            f"👤 <b>Ім'я:</b> {full_name}\n"
+            f"👥 <b>@нік:</b> {username_str}\n"
+            f"🏠 <b>Квартира:</b> {apartment_info}\n"
+            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n\n"
+            f"💬 <b>Повідомлення:</b>\n{escaped_text}\n\n"
+            "ℹ️ <i>Щоб відповісти користувачеві, зробіть Reply на це повідомлення.</i>"
         )
 
         admin_chat_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
@@ -2173,12 +2179,30 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
             extra_kwargs["message_thread_id"] = support_thread_id
 
         try:
-            admin_msg = await context.bot.send_message(
-                chat_id=admin_chat_id,
-                text=admin_text,
-                parse_mode="Markdown",
-                **extra_kwargs,
-            )
+            try:
+                admin_msg = await context.bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=admin_html,
+                    parse_mode="HTML",
+                    **extra_kwargs,
+                )
+            except Exception as html_err:
+                logger.warning(f"Failed to send HTML formatted support message ({html_err}), falling back to plain text")
+                plain_text = (
+                    "✉️ Питання до адмінів\n\n"
+                    f"👤 Ім'я: {raw_full_name}\n"
+                    f"👥 @нік: {raw_username_str}\n"
+                    f"🏠 Квартира: {raw_apartment_info}\n"
+                    f"🆔 User ID: {user_id}\n\n"
+                    f"💬 Повідомлення:\n{text}\n\n"
+                    "ℹ️ Щоб відповісти користувачеві, зробіть Reply на це повідомлення."
+                )
+                admin_msg = await context.bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=plain_text,
+                    **extra_kwargs,
+                )
+
             # Save mapping in SQLite and in-memory dicts
             db_save_support_message(admin_msg.message_id, user_id)
             db_update_rate_limit(user_id)
@@ -2215,17 +2239,18 @@ async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE
 
             # Try to send a message with chat info
             try:
+                chat_title_escaped = html.escape(chat.title or "")
                 await context.bot.send_message(
                     chat_id=chat.id,
                     text=(
                         f"✅ Бот додано до цієї групи!\n\n"
                         f"📋 Інформація про чат:\n"
-                        f"Назва: {chat.title}\n"
-                        f"Chat ID: `{chat.id}`\n"
+                        f"Назва: {chat_title_escaped}\n"
+                        f"Chat ID: <code>{chat.id}</code>\n"
                         f"Тип: {chat.type}\n\n"
                         f"Використовуйте цей Chat ID у вашій .env конфігурації."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
             except Exception as e:
                 logger.error(f"Could not send message to chat {chat.id}: {e}")
