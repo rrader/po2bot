@@ -42,3 +42,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Persistence
+data/
+*.pickle
+

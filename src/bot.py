@@ -4,7 +4,9 @@ import logging
 import os
 import tempfile
 from datetime import datetime
-from typing import Dict, Optional
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Dict, Optional, Set
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -13,6 +15,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     ChatMemberHandler,
+    PicklePersistence,
     filters,
     ContextTypes,
 )
@@ -34,13 +37,14 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID"))
-PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID"))
+ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID") or 0)
+PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID") or 0)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS")
 SPREADSHEET_ID = "1uuGXerA9I0eHTR2fNkektO8uS47T0zR1ITZIA1pnyBM"
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Test")  # Default to "Test" for staging
 ROOMMATES_WORKSHEET_NAME = os.getenv("ROOMMATES_WORKSHEET_NAME", "СпівмешканціTest")  # Default to "СпівмешканціTest" for staging
+PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "data/bot_persistence.pickle")
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -69,10 +73,58 @@ admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
 # Store roommate approval requests (waiting for owner confirmation)
 roommate_approval_state: Dict[int, dict] = {}  # {message_id: {roommate_user_id, owner_phone, etc}}
 
+
+def get_pending_requests(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Dict[int, dict]:
+    """Get pending requests from context.bot_data if available, otherwise global dict."""
+    global pending_requests
+    if context is not None and hasattr(context, "bot_data") and context.bot_data is not None:
+        if "pending_requests" not in context.bot_data:
+            context.bot_data["pending_requests"] = pending_requests
+        return context.bot_data["pending_requests"]
+    return pending_requests
+
+
+def get_admin_rejection_state(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Dict[int, int]:
+    """Get admin rejection state from context.bot_data if available, otherwise global dict."""
+    global admin_rejection_state
+    if context is not None and hasattr(context, "bot_data") and context.bot_data is not None:
+        if "admin_rejection_state" not in context.bot_data:
+            context.bot_data["admin_rejection_state"] = admin_rejection_state
+        return context.bot_data["admin_rejection_state"]
+    return admin_rejection_state
+
+
+def get_roommate_approval_state(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Dict[int, dict]:
+    """Get roommate approval state from context.bot_data if available, otherwise global dict."""
+    global roommate_approval_state
+    if context is not None and hasattr(context, "bot_data") and context.bot_data is not None:
+        if "roommate_approval_state" not in context.bot_data:
+            context.bot_data["roommate_approval_state"] = roommate_approval_state
+        return context.bot_data["roommate_approval_state"]
+    return roommate_approval_state
+
+
+async def post_init(application: Application) -> None:
+    """Synchronize global in-memory state with persisted application.bot_data on startup."""
+    global pending_requests, admin_rejection_state, roommate_approval_state
+    if "pending_requests" in application.bot_data:
+        pending_requests.update(application.bot_data["pending_requests"])
+    application.bot_data["pending_requests"] = pending_requests
+
+    if "admin_rejection_state" in application.bot_data:
+        admin_rejection_state.update(application.bot_data["admin_rejection_state"])
+    application.bot_data["admin_rejection_state"] = admin_rejection_state
+
+    if "roommate_approval_state" in application.bot_data:
+        roommate_approval_state.update(application.bot_data["roommate_approval_state"])
+    application.bot_data["roommate_approval_state"] = roommate_approval_state
+
+
 DAH_INVITE_SUGGESTION = (
     "\n\n🏠 Щоб скоріше створити ОСББ, також пропонуємо приєднатися до застосунку \"Дах\" для мешканців будинку:\n"
     "http://app.dah.in.ua/oNCk"
 )
+
 
 
 def normalize_phone(phone: str) -> str:
@@ -602,6 +654,18 @@ async def roommate_owner_phone_received(update: Update, context: ContextTypes.DE
 async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle document upload and try to parse it with OpenAI."""
     message = update.message
+    if not message:
+        return DOCUMENT
+
+    # Check for media groups (albums) and skip duplicate processing of secondary files
+    media_group_id = message.media_group_id
+    if media_group_id:
+        processed_groups = context.user_data.setdefault("_processed_media_groups", set())
+        if media_group_id in processed_groups:
+            logger.info(f"Skipping additional media item from album group {media_group_id}")
+            return DOCUMENT
+        processed_groups.add(media_group_id)
+
     document = message.document
     photo = message.photo[-1] if message.photo else None
 
@@ -753,7 +817,8 @@ async def apartment_number_received(update: Update, context: ContextTypes.DEFAUL
             "⚠️ Можете заблюрити всі особисті дані, які вважаєте за потрібне.\n"
             "Головне, щоб було видно:\n"
             "• Номер приміщення\n"
-            "• Площу"
+            "• Площу",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return DOCUMENT
 
@@ -761,7 +826,17 @@ async def apartment_number_received(update: Update, context: ContextTypes.DEFAUL
     if "вручну" in user_input.lower() or "✏️" in user_input:
         await update.message.reply_text(
             "Добре, введемо дані вручну.\n\n"
-            "Спочатку вкажіть номер квартири:"
+            "Спочатку вкажіть номер квартири:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return APARTMENT_NUMBER
+
+    # Check if stale button from earlier steps was clicked
+    if user_input in ("🏠 Я власник квартири", "👥 Інший користувач", "➕ Додати ще одну квартиру"):
+        await update.message.reply_text(
+            "⚠️ Зараз очікується номер квартири/приміщення (наприклад: 42 або 15-А).\n\n"
+            "Введіть номер квартири або скористайтеся /start, щоб почати спочатку.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return APARTMENT_NUMBER
 
@@ -771,7 +846,8 @@ async def apartment_number_received(update: Update, context: ContextTypes.DEFAUL
 
     await update.message.reply_text(
         f"✅ Номер квартири: {apartment_number}\n\n"
-        "Тепер вкажіть площу квартири (в м²):"
+        "Тепер вкажіть площу квартири (в м²):",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     return AREA
@@ -780,6 +856,15 @@ async def apartment_number_received(update: Update, context: ContextTypes.DEFAUL
 async def area_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle area and ask for document type."""
     area = update.message.text.strip()
+
+    # Check if stale button was pressed
+    if area in ("🏠 Я власник квартири", "👥 Інший користувач", "✅ Так, все вірно", "✏️ Ні, я виправлю вручну"):
+        await update.message.reply_text(
+            "⚠️ Зараз очікується загальна площа квартири в м² (наприклад: 45.6 або 54).\n\n"
+            "Введіть число або скористайтеся /start, щоб почати спочатку."
+        )
+        return AREA
+
     context.user_data["area"] = area
 
     # Create keyboard for document type
@@ -805,18 +890,47 @@ async def confirm_data_received(update: Update, context: ContextTypes.DEFAULT_TY
     if "так" in response.lower() or "✅" in response:
         # User confirmed data is correct, proceed to send to admin
         return await send_to_admin(update, context)
-    else:
+    elif "ні" in response.lower() or "виправ" in response.lower() or "✏️" in response:
         # User wants to correct data manually
         await update.message.reply_text(
             "Добре, введемо дані вручну.\n\n"
-            "Спочатку вкажіть номер квартири:"
+            "Спочатку вкажіть номер квартири:",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return APARTMENT_NUMBER
+    else:
+        keyboard = [
+            [KeyboardButton("✅ Так, все вірно")],
+            [KeyboardButton("✏️ Ні, я виправлю вручну")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(
+            "⚠️ Будь ласка, підтвердіть правильність даних, обравши один з варіантів на кнопках:",
+            reply_markup=reply_markup,
+        )
+        return CONFIRM_DATA
 
 
 async def document_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle document type and show confirmation."""
-    document_type = update.message.text.strip()
+    raw_doc_type = update.message.text.strip()
+
+    if "інвест" in raw_doc_type.lower():
+        document_type = "Договір інвестування"
+    elif "власност" in raw_doc_type.lower() or "витяг" in raw_doc_type.lower():
+        document_type = "Право власності (витяг з реєстру)"
+    else:
+        keyboard = [
+            [KeyboardButton("📄 Договір інвестування")],
+            [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        await update.message.reply_text(
+            "⚠️ Будь ласка, оберіть тип документа за допомогою кнопок нижче:",
+            reply_markup=reply_markup,
+        )
+        return DOCUMENT_TYPE
+
     context.user_data["document_type"] = document_type
 
     apartment_number = context.user_data.get("apartment_number", "")
@@ -856,7 +970,8 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     document_kind = context.user_data.get("document_kind", "photo")
 
     # Store request
-    pending_requests[user_id] = {
+    requests_dict = get_pending_requests(context)
+    requests_dict[user_id] = {
         "user_id": user_id,
         "phone_number": phone_number,
         "username": username,
@@ -867,6 +982,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "area": area,
         "document_type": document_type,
     }
+    pending_requests[user_id] = requests_dict[user_id]
 
     # Create approval keyboard
     keyboard = [
@@ -915,25 +1031,41 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     await update.message.reply_text(
         "✅ Ваш запит надіслано!\n\n"
-        "Адміністратор перегляне вашу інформацію, і ви отримаєте повідомлення після схвалення."
+        "Адміністратор перегляне вашу інформацію, і ви отримаєте повідомлення після схвалення.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     return WAITING_APPROVAL
 
 
+
 async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle roommate approval/rejection by owner."""
-    parts = query.data.split("_")
-    action = parts[0] + "_" + parts[1]  # approve_roommate or reject_roommate
-    roommate_user_id = int(parts[2])
-
-    if roommate_user_id not in roommate_approval_state:
-        await query.edit_message_text(
-            text=query.message.text + "\n\n❌ Запит застарів або вже оброблений."
-        )
+    try:
+        parts = query.data.split("_")
+        if len(parts) != 3 or parts[0] not in ("approve", "reject") or parts[1] != "roommate":
+            logger.warning(f"Unexpected roommate callback data: {query.data}")
+            await query.answer("Невідома або застаріла дія.", show_alert=True)
+            return
+        action = parts[0] + "_" + parts[1]  # approve_roommate or reject_roommate
+        roommate_user_id = int(parts[2])
+    except Exception as e:
+        logger.warning(f"Error parsing roommate callback query {query.data}: {e}")
+        await query.answer("Не вдалося розпізнати дію.", show_alert=True)
         return
 
-    roommate_request = roommate_approval_state[roommate_user_id]
+    roommates_dict = get_roommate_approval_state(context)
+    if roommate_user_id not in roommates_dict:
+        try:
+            await query.edit_message_text(
+                text=query.message.text + "\n\n❌ Запит застарів або вже оброблений."
+            )
+        except Exception:
+            pass
+        await query.answer("Запит застарів або вже оброблений.", show_alert=True)
+        return
+
+    roommate_request = roommates_dict[roommate_user_id]
     roommate_data = roommate_request["roommate_data"]
     owner_data = roommate_request["owner_data"]
     apartment_number = roommate_request["apartment_number"]
@@ -968,7 +1100,10 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
             logger.info(f"Roommate {roommate_user_id} approved by owner {owner_name}")
 
             # Clean up
-            del roommate_approval_state[roommate_user_id]
+            if roommate_user_id in roommates_dict:
+                del roommates_dict[roommate_user_id]
+            if roommate_user_id in roommate_approval_state:
+                del roommate_approval_state[roommate_user_id]
 
         except Exception as e:
             logger.error(f"Error approving roommate {roommate_user_id}: {e}")
@@ -991,7 +1126,10 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
         logger.info(f"Roommate {roommate_user_id} rejected by owner {owner_name}")
 
         # Clean up
-        del roommate_approval_state[roommate_user_id]
+        if roommate_user_id in roommates_dict:
+            del roommates_dict[roommate_user_id]
+        if roommate_user_id in roommate_approval_state:
+            del roommate_approval_state[roommate_user_id]
 
 
 async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1004,16 +1142,36 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return await handle_roommate_approval(query, context)
 
     # Regular owner approval by admin
-    action, user_id_str = query.data.split("_")
-    user_id = int(user_id_str)
-
-    if user_id not in pending_requests:
-        await query.edit_message_caption(
-            caption=query.message.caption + "\n\n❌ Запит застарів або вже оброблений."
-        )
+    try:
+        parts = query.data.split("_")
+        if len(parts) != 2 or parts[0] not in ("approve", "reject"):
+            logger.warning(f"Unexpected callback query data format: {query.data}")
+            await query.answer("Невідома або застаріла дія.", show_alert=True)
+            return
+        action, user_id_str = parts
+        user_id = int(user_id_str)
+    except Exception as e:
+        logger.warning(f"Error parsing callback query {query.data}: {e}")
+        await query.answer("Не вдалося розпізнати дію.", show_alert=True)
         return
 
-    request_data = pending_requests[user_id]
+    pending = get_pending_requests(context)
+    if user_id not in pending:
+        try:
+            if query.message.caption:
+                await query.edit_message_caption(
+                    caption=query.message.caption + "\n\n❌ Запит застарів або вже оброблений."
+                )
+            elif query.message.text:
+                await query.edit_message_text(
+                    text=query.message.text + "\n\n❌ Запит застарів або вже оброблений."
+                )
+        except Exception:
+            pass
+        await query.answer("Запит застарів або вже оброблений.", show_alert=True)
+        return
+
+    request_data = pending[user_id]
     admin_name = query.from_user.first_name
 
     if action == "approve":
@@ -1061,7 +1219,10 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             logger.info(f"User {user_id} approved by {admin_name}")
 
             # Remove from pending after successful approval
-            del pending_requests[user_id]
+            if user_id in pending:
+                del pending[user_id]
+            if user_id in pending_requests:
+                del pending_requests[user_id]
 
         except Exception as e:
             logger.error(f"Error approving user {user_id}: {e}")
@@ -1075,6 +1236,8 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     else:  # reject
         # Ask admin for rejection reason
+        rejection_dict = get_admin_rejection_state(context)
+        rejection_dict[query.message.message_id] = user_id
         admin_rejection_state[query.message.message_id] = user_id
 
         await query.edit_message_caption(
@@ -1087,21 +1250,26 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle rejection reason from admin."""
     # Check if this is a reply to a message waiting for rejection reason
-    if not update.message.reply_to_message:
+    if not update.message or not update.message.reply_to_message:
         return
 
     message_id = update.message.reply_to_message.message_id
+    rejection_dict = get_admin_rejection_state(context)
 
-    if message_id not in admin_rejection_state:
+    if message_id not in rejection_dict:
         return
 
-    user_id = admin_rejection_state[message_id]
+    user_id = rejection_dict[message_id]
     rejection_reason = update.message.text.strip()
     admin_name = update.message.from_user.first_name
 
-    if user_id not in pending_requests:
+    pending = get_pending_requests(context)
+    if user_id not in pending:
         await update.message.reply_text("❌ Запит застарів або вже оброблений.")
-        del admin_rejection_state[message_id]
+        if message_id in rejection_dict:
+            del rejection_dict[message_id]
+        if message_id in admin_rejection_state:
+            del admin_rejection_state[message_id]
         return
 
     # Notify user with rejection reason
@@ -1123,21 +1291,173 @@ async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_
     except Exception as e:
         logger.error(f"Error updating admin message: {e}")
 
-    await update.message.reply_text(f"✅ Запит відхилено. Користувач отримав повідомлення з причиною.")
+    await update.message.reply_text("✅ Запит відхилено. Користувач отримав повідомлення з причиною.")
 
     logger.info(f"User {user_id} rejected by {admin_name} with reason: {rejection_reason}")
 
     # Clean up
-    del pending_requests[user_id]
-    del admin_rejection_state[message_id]
+    if user_id in pending:
+        del pending[user_id]
+    if user_id in pending_requests:
+        del pending_requests[user_id]
+    if message_id in rejection_dict:
+        del rejection_dict[message_id]
+    if message_id in admin_rejection_state:
+        del admin_rejection_state[message_id]
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the conversation."""
+    context.user_data.clear()
     await update.message.reply_text(
-        "❌ Процес верифікації скасовано. Використайте /start, щоб розпочати знову."
+        "❌ Процес верифікації скасовано. Використайте /start, щоб розпочати знову.",
+        reply_markup=ReplyKeyboardRemove(),
     )
     return ConversationHandler.END
+
+
+# ============================================================================
+# Fallback / Informational handlers for unexpected input at each step
+# ============================================================================
+
+async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for contact."""
+    keyboard = [
+        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "📱 Будь ласка, поділіться своїм номером телефону за допомогою кнопки нижче.\n\n"
+        "Якщо кнопка зникла або ви хочете почати спочатку — надішліть /start.",
+        reply_markup=reply_markup,
+    )
+    return PHONE_NUMBER
+
+
+async def user_type_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for user type selection."""
+    if context.user_data.get("already_registered"):
+        keyboard = [
+            [KeyboardButton("➕ Додати ще одну квартиру")],
+            [KeyboardButton("❌ Скасувати")],
+        ]
+    else:
+        keyboard = [
+            [KeyboardButton("🏠 Я власник квартири")],
+            [KeyboardButton("👥 Інший користувач")],
+        ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "⚠️ Будь ласка, оберіть ваш статус за допомогою кнопок нижче:\n"
+        "• «🏠 Я власник квартири» — якщо ви є власником\n"
+        "• «👥 Інший користувач» — якщо ви орендар або співмешканець\n\n"
+        "Або надішліть /start для перезапуску.",
+        reply_markup=reply_markup,
+    )
+    return USER_TYPE
+
+
+async def roommate_owner_phone_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for roommate's owner search info."""
+    await update.message.reply_text(
+        "Будь ласка, вкажіть номер телефону власника (380XXXXXXXXX або 0XXXXXXXXX) "
+        "або його Telegram @username текстом.\n\n"
+        "Якщо хочете скасувати — надішліть /cancel або /start."
+    )
+    return ROOMMATE_OWNER_PHONE
+
+
+async def document_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for document upload."""
+    await update.message.reply_text(
+        "📄 Очікується фото або PDF-файл документа (договір або витяг з реєстру).\n\n"
+        "Будь ласка, завантажте документ як фотографію або файл PDF.\n"
+        "Якщо хочете почати спочатку — надішліть /start."
+    )
+    return DOCUMENT
+
+
+async def apartment_number_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for apartment number."""
+    keyboard = [
+        [KeyboardButton("📷 Завантажити нове фото")],
+        [KeyboardButton("✏️ Ввести дані вручну")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "Будь ласка, введіть номер квартири текстом, або завантажте нове фото/PDF документа.",
+        reply_markup=reply_markup,
+    )
+    return APARTMENT_NUMBER
+
+
+async def area_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for area."""
+    await update.message.reply_text(
+        "Будь ласка, вкажіть загальну площу квартири в м² текстом (наприклад: 45.6):"
+    )
+    return AREA
+
+
+async def document_type_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for document type."""
+    keyboard = [
+        [KeyboardButton("📄 Договір інвестування")],
+        [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "Будь ласка, оберіть тип документа за допомогою кнопок нижче:",
+        reply_markup=reply_markup,
+    )
+    return DOCUMENT_TYPE
+
+
+async def confirm_data_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle unexpected messages when waiting for data confirmation."""
+    keyboard = [
+        [KeyboardButton("✅ Так, все вірно")],
+        [KeyboardButton("✏️ Ні, я виправлю вручну")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    await update.message.reply_text(
+        "Будь ласка, підтвердіть правильність даних кнопкою «✅ Так, все вірно» або оберіть «✏️ Ні, я виправлю вручну».",
+        reply_markup=reply_markup,
+    )
+    return CONFIRM_DATA
+
+
+async def waiting_approval_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reply when user sends messages while request is under admin review."""
+    await update.message.reply_text(
+        "⏳ Ваша заявка вже передана адміністраторам і очікує на розгляд.\n\n"
+        "Бот обов'язково сповістить вас, щойно статус зміниться.\n"
+        "Якщо вам необхідно надіслати нову заявку — надішліть /start."
+    )
+    return WAITING_APPROVAL
+
+
+async def waiting_owner_approval_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reply when roommate sends messages while waiting for owner review."""
+    await update.message.reply_text(
+        "⏳ Запит надіслано власнику квартири і очікує на підтвердження.\n\n"
+        "Щойно власник відреагує, бот надішле вам сповіщення.\n"
+        "Якщо ви хочете скасувати або почати заново — надішліть /start."
+    )
+    return WAITING_OWNER_APPROVAL
+
+
+async def unhandled_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply to messages sent outside active conversation in private chats."""
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "🤖 Бот не очікує цього повідомлення або сесію було скинуто після перезапуску.\n\n"
+        "Будь ласка, скористайтеся командою /start, щоб розпочати верифікацію."
+    )
 
 
 async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1174,60 +1494,89 @@ async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.error(f"Could not send message to chat {chat.id}: {e}")
 
 
-def main() -> None:
-    """Start the bot."""
-    if not BOT_TOKEN:
+def build_application() -> Optional[Application]:
+    """Build and configure the Application instance."""
+    token = os.getenv("BOT_TOKEN") or BOT_TOKEN
+    admin_group_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
+    private_group_id = int(os.getenv("PRIVATE_GROUP_ID") or PRIVATE_GROUP_ID or 0)
+
+    if not token:
         logger.error("BOT_TOKEN not found in environment variables")
-        return
+        return None
 
-    if not ADMIN_GROUP_ID:
+    if not admin_group_id:
         logger.error("ADMIN_GROUP_ID not found in environment variables")
-        return
+        return None
 
-    if not PRIVATE_GROUP_ID:
+    if not private_group_id:
         logger.error("PRIVATE_GROUP_ID not found in environment variables")
-        return
+        return None
 
-    logger.info(f"Configuration loaded - Admin Group: {ADMIN_GROUP_ID}, Private Group: {PRIVATE_GROUP_ID}")
+    logger.info(f"Configuration loaded - Admin Group: {admin_group_id}, Private Group: {private_group_id}")
 
-    # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(token)
+
+    # Configure persistence if file path is provided
+    is_persistent = False
+
+    if PERSISTENCE_FILE and PERSISTENCE_FILE.lower() not in ("none", "false", "0"):
+        os.makedirs(os.path.dirname(PERSISTENCE_FILE) or ".", exist_ok=True)
+        persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+        builder = builder.persistence(persistence)
+        builder = builder.post_init(post_init)
+        is_persistent = True
+
+    application = builder.build()
 
     # Conversation handler
     conv_handler = ConversationHandler(
+        name="verification_conversation",
+        persistent=is_persistent,
         entry_points=[CommandHandler("start", start)],
         states={
             PHONE_NUMBER: [
                 MessageHandler(filters.CONTACT, phone_number_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, phone_number_fallback),
             ],
             USER_TYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, user_type_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, user_type_fallback),
             ],
             ROOMMATE_OWNER_PHONE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, roommate_owner_phone_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, roommate_owner_phone_fallback),
             ],
             DOCUMENT: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, document_fallback),
             ],
             APARTMENT_NUMBER: [
                 MessageHandler(filters.PHOTO | filters.Document.ALL, document_received),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, apartment_number_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, apartment_number_fallback),
             ],
             AREA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, area_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, area_fallback),
             ],
             DOCUMENT_TYPE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, document_type_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, document_type_fallback),
             ],
             CONFIRM_DATA: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_data_received),
+                MessageHandler(filters.ALL & ~filters.COMMAND, confirm_data_fallback),
             ],
-            WAITING_APPROVAL: [],
-            WAITING_OWNER_APPROVAL: [],
+            WAITING_APPROVAL: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, waiting_approval_message),
+            ],
+            WAITING_OWNER_APPROVAL: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, waiting_owner_approval_message),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CommandHandler("start", start)
+            CommandHandler("start", start),
         ],
     )
 
@@ -1240,13 +1589,96 @@ def main() -> None:
     application.add_handler(
         MessageHandler(
             filters.TEXT & filters.REPLY & ~filters.COMMAND,
-            handle_rejection_reason
+            handle_rejection_reason,
         )
     )
+
+    # Catch-all for private messages outside active conversation (lowest priority)
+    application.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND,
+            unhandled_private_message,
+        )
+    )
+
+    return application
+
+
+def main() -> None:
+    """Start the bot."""
+    application = build_application()
+    if not application:
+        return
+
+    # Start HTTP status server
+    start_status_server(port=8088)
 
     # Start bot
     logger.info("Bot started")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+
+_bot_start_time = datetime.now()
+
+
+class BotStatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            if self.path == "/health":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+            elif self.path == "/status":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                uptime_sec = int((datetime.now() - _bot_start_time).total_seconds())
+                data = {
+                    "status": "running",
+                    "uptime_seconds": uptime_sec,
+                    "worksheet": WORKSHEET_NAME,
+                    "roommates_worksheet": ROOMMATES_WORKSHEET_NAME,
+                    "pending_count": len(pending_requests),
+                    "google_sheets_connected": google_sheets_client is not None,
+                    "openai_connected": openai_client is not None,
+                }
+                self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+            elif self.path == "/pending":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                items = []
+                for uid, req in pending_requests.items():
+                    items.append({
+                        "user_id": uid,
+                        "phone": req.get("phone", ""),
+                        "apartment": req.get("apartment_number", ""),
+                        "user_type": req.get("user_type", ""),
+                        "document_type": req.get("document_type", ""),
+                    })
+                self.wfile.write(json.dumps({"pending": items}, ensure_ascii=False).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            self.send_response(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_status_server(port=8088):
+    try:
+        server = HTTPServer(("0.0.0.0", port), BotStatusHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        logger.info(f"Po2Bot HTTP Status Server running on port {port}")
+    except Exception as e:
+        logger.error(f"Failed to start Po2Bot HTTP Status Server: {e}")
 
 
 if __name__ == "__main__":
