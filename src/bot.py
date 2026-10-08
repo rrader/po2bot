@@ -1396,6 +1396,29 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 
+async def reset_user_conversation(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    """Reset active conversation and clear user state when request is resolved (approved/rejected)."""
+    app = getattr(context, "application", None)
+    if not app:
+        return
+
+    key = (user_id, user_id)
+    # 1. Clear in-memory conversation state from any ConversationHandler
+    handlers_dict = getattr(app, "handlers", {})
+    for handler_list in handlers_dict.values():
+        for h in handler_list:
+            if isinstance(h, ConversationHandler):
+                if hasattr(h, "_conversations") and key in h._conversations:
+                    h._conversations.pop(key, None)
+
+    # 2. Update persistence if enabled
+    if hasattr(app, "persistence") and app.persistence:
+        try:
+            await app.persistence.update_conversation("verification_conversation", key, None)
+        except Exception as e:
+            logger.warning(f"Error resetting persistence conversation for user {user_id}: {e}")
+
+
 async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle roommate approval/rejection by owner."""
     try:
@@ -1456,11 +1479,12 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
 
             logger.info(f"Roommate {roommate_user_id} approved by owner {owner_name}")
 
-            # Clean up
+            # Clean up and reset conversation state
             if roommate_user_id in roommates_dict:
                 del roommates_dict[roommate_user_id]
             if roommate_user_id in roommate_approval_state:
                 del roommate_approval_state[roommate_user_id]
+            await reset_user_conversation(context, roommate_user_id)
 
         except Exception as e:
             logger.error(f"Error approving roommate {roommate_user_id}: {e}")
@@ -1472,7 +1496,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
         # Notify roommate
         await context.bot.send_message(
             chat_id=roommate_user_id,
-            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання."
+            text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання.",
         )
 
         # Update owner's message
@@ -1482,11 +1506,12 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
 
         logger.info(f"Roommate {roommate_user_id} rejected by owner {owner_name}")
 
-        # Clean up
+        # Clean up and reset conversation state
         if roommate_user_id in roommates_dict:
             del roommates_dict[roommate_user_id]
         if roommate_user_id in roommate_approval_state:
             del roommate_approval_state[roommate_user_id]
+        await reset_user_conversation(context, roommate_user_id)
 
 
 async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1580,6 +1605,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 del pending[user_id]
             if user_id in pending_requests:
                 del pending_requests[user_id]
+            await reset_user_conversation(context, user_id)
 
         except Exception as e:
             logger.error(f"Error approving user {user_id}: {e}")
@@ -1692,7 +1718,9 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
         chat_id=user_id,
         text=(
             f"❌ На жаль, ваш запит відхилено адміністратором {admin_name}.\n\n"
-            f"Причина: {rejection_reason}"
+            f"Причина: {rejection_reason}\n\n"
+            "Якщо у вас є запитання, напишіть їх сюди в чат (бот запропонує надіслати їх адмінам), "
+            "або скористайтеся /start щоб почати спочатку."
         ),
     )
 
@@ -1710,7 +1738,7 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
 
     logger.info(f"User {user_id} rejected by {admin_name} with reason: {rejection_reason}")
 
-    # Clean up
+    # Clean up and reset conversation state
     if user_id in pending:
         del pending[user_id]
     if user_id in pending_requests:
@@ -1719,6 +1747,7 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
         del rejection_dict[message_id]
     if message_id in admin_rejection_state:
         del admin_rejection_state[message_id]
+    await reset_user_conversation(context, user_id)
 
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1929,6 +1958,34 @@ async def confirm_data_fallback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def waiting_approval_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Reply when user sends messages while request is under admin review."""
+    user_id = update.effective_user.id if update.effective_user else 0
+    pending = get_pending_requests(context)
+
+    # If request was already approved or rejected, user is no longer pending
+    if user_id not in pending and user_id not in pending_requests:
+        await reset_user_conversation(context, user_id)
+        await unhandled_private_message(update, context)
+        return ConversationHandler.END
+
+    text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
+    if text:
+        # User is asking something while waiting for approval — offer to send to admins
+        context.user_data["pending_feedback_text"] = text
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
+                InlineKeyboardButton("❌ Ні", callback_data="feedback_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        preview = text if len(text) <= 300 else text[:297] + "..."
+        await update.message.reply_text(
+            f"💬 Ви написали:\n«{preview}»\n\n"
+            "Ваша заявка очікує на розгляд. Надіслати це повідомлення як запитання адмінам?",
+            reply_markup=reply_markup,
+        )
+        return WAITING_APPROVAL
+
     await update.message.reply_text(
         "⏳ Ваша заявка вже передана адміністраторам і очікує на розгляд.\n\n"
         "Бот обов'язково сповістить вас, щойно статус зміниться.\n"
@@ -1939,6 +1996,32 @@ async def waiting_approval_message(update: Update, context: ContextTypes.DEFAULT
 
 async def waiting_owner_approval_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Reply when roommate sends messages while waiting for owner review."""
+    user_id = update.effective_user.id if update.effective_user else 0
+    roommates_dict = get_roommate_approval_state(context)
+
+    if user_id not in roommates_dict and user_id not in roommate_approval_state:
+        await reset_user_conversation(context, user_id)
+        await unhandled_private_message(update, context)
+        return ConversationHandler.END
+
+    text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
+    if text:
+        context.user_data["pending_feedback_text"] = text
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
+                InlineKeyboardButton("❌ Ні", callback_data="feedback_cancel"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        preview = text if len(text) <= 300 else text[:297] + "..."
+        await update.message.reply_text(
+            f"💬 Ви написали:\n«{preview}»\n\n"
+            "Ваш запит очікує на підтвердження власника. Надіслати це повідомлення як запитання адмінам?",
+            reply_markup=reply_markup,
+        )
+        return WAITING_OWNER_APPROVAL
+
     await update.message.reply_text(
         "⏳ Запит надіслано власнику квартири і очікує на підтвердження.\n\n"
         "Щойно власник відреагує, бот надішле вам сповіщення.\n"

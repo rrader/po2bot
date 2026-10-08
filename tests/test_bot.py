@@ -234,11 +234,20 @@ async def test_fallbacks_respond_and_stay_in_state():
     assert s_doc == bot.DOCUMENT
     assert "фото або PDF" in up_doc.message.replies[0]
 
-    # Waiting approval fallback
+    # Waiting approval fallback (when request is actually pending)
     up_wait = _FakeUpdate()
+    bot.pending_requests[up_wait.effective_user.id] = {}
     s_wait = await bot.waiting_approval_message(up_wait, context)
     assert s_wait == bot.WAITING_APPROVAL
     assert "очікує на розгляд" in up_wait.message.replies[0]
+    bot.pending_requests.pop(up_wait.effective_user.id, None)
+
+    # When request was resolved/rejected, sending text offers to contact admins
+    up_resolved = _FakeUpdate()
+    up_resolved.message.text = "???"
+    s_resolved = await bot.waiting_approval_message(up_resolved, context)
+    assert s_resolved == bot.ConversationHandler.END
+    assert "Надіслати це адмінам?" in up_resolved.message.replies[0]
 
 
 @pytest.mark.asyncio
