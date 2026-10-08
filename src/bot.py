@@ -2,7 +2,9 @@ import base64
 import json
 import logging
 import os
+import sqlite3
 import tempfile
+import time
 from datetime import datetime
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,12 +21,18 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+import io
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pypdfium2 as pdfium
 from PIL import Image
+import pillow_heif
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# Register HEIF opener with Pillow for HEIC image support
+pillow_heif.register_heif_opener()
+
 
 # Load environment variables
 load_dotenv()
@@ -39,12 +47,16 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID") or 0)
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID") or 0)
+ADMIN_SUPPORT_THREAD_ID = int(os.getenv("ADMIN_SUPPORT_THREAD_ID") or 0) or None
+ADMIN_REQUESTS_THREAD_ID = int(os.getenv("ADMIN_REQUESTS_THREAD_ID") or 0) or None
+SUPPORT_RATE_LIMIT_SECONDS = int(os.getenv("SUPPORT_RATE_LIMIT_SECONDS") or 180)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS")
 SPREADSHEET_ID = "1uuGXerA9I0eHTR2fNkektO8uS47T0zR1ITZIA1pnyBM"
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Test")  # Default to "Test" for staging
 ROOMMATES_WORKSHEET_NAME = os.getenv("ROOMMATES_WORKSHEET_NAME", "СпівмешканціTest")  # Default to "СпівмешканціTest" for staging
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "data/bot_persistence.pickle")
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(PERSISTENCE_FILE) or "data", "bot_support.db"))
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -72,6 +84,9 @@ admin_rejection_state: Dict[int, int] = {}  # {message_id: user_id}
 
 # Store roommate approval requests (waiting for owner confirmation)
 roommate_approval_state: Dict[int, dict] = {}  # {message_id: {roommate_user_id, owner_phone, etc}}
+
+# Store support ticket messages for admin replies (admin_message_id -> user_id)
+support_messages: Dict[int, int] = {}
 
 
 def get_pending_requests(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Dict[int, dict]:
@@ -104,9 +119,196 @@ def get_roommate_approval_state(context: Optional[ContextTypes.DEFAULT_TYPE] = N
     return roommate_approval_state
 
 
+def get_support_messages(context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Dict[int, int]:
+    """Get support messages mapping from context.bot_data if available, otherwise global dict."""
+    global support_messages
+    if context is not None and hasattr(context, "bot_data") and context.bot_data is not None:
+        if "support_messages" not in context.bot_data:
+            context.bot_data["support_messages"] = support_messages
+        return context.bot_data["support_messages"]
+    return support_messages
+
+
+def init_db(db_path: Optional[str] = None) -> None:
+    """Initialize SQLite database for support messages, rate limits, and banned users."""
+    path = db_path or DB_PATH
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with sqlite3.connect(path) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS support_messages (
+                admin_message_id INTEGER PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                replied_by TEXT,
+                replied_at TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id INTEGER PRIMARY KEY,
+                last_question_time REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_by TEXT,
+                reason TEXT,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+def db_save_support_message(admin_message_id: int, user_id: int, db_path: Optional[str] = None) -> None:
+    """Save mapping of admin group message ID to user ID in SQLite."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO support_messages (admin_message_id, user_id) VALUES (?, ?)",
+                (admin_message_id, user_id),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving support message {admin_message_id} -> {user_id}: {e}")
+
+
+def db_get_support_user_id(admin_message_id: int, db_path: Optional[str] = None) -> Optional[int]:
+    """Retrieve user ID by admin group message ID from SQLite."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id FROM support_messages WHERE admin_message_id = ?",
+                (admin_message_id,),
+            )
+            row = cursor.fetchone()
+            return row[0] if row else None
+    except Exception as e:
+        logger.error(f"Error getting support user ID for msg {admin_message_id}: {e}")
+        return None
+
+
+def db_mark_support_replied(admin_message_id: int, admin_name: str, db_path: Optional[str] = None) -> Optional[str]:
+    """Mark support message as replied in SQLite. Returns previous admin name if already replied, else None."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT replied_by FROM support_messages WHERE admin_message_id = ?",
+                (admin_message_id,),
+            )
+            row = cursor.fetchone()
+            prev_admin = row[0] if row and row[0] else None
+
+            cursor.execute(
+                "UPDATE support_messages SET replied_by = ?, replied_at = CURRENT_TIMESTAMP WHERE admin_message_id = ?",
+                (admin_name, admin_message_id),
+            )
+            conn.commit()
+            return prev_admin
+    except Exception as e:
+        logger.error(f"Error marking support message {admin_message_id} as replied: {e}")
+        return None
+
+
+def db_check_rate_limit(user_id: int, limit_seconds: int = 180, db_path: Optional[str] = None) -> Optional[float]:
+    """Check if user is rate limited. Returns remaining seconds if limited, else None."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        now = time.time()
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT last_question_time FROM rate_limits WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if row:
+                elapsed = now - row[0]
+                if elapsed < limit_seconds:
+                    return limit_seconds - elapsed
+        return None
+    except Exception as e:
+        logger.error(f"Error checking rate limit for user {user_id}: {e}")
+        return None
+
+
+def db_update_rate_limit(user_id: int, db_path: Optional[str] = None) -> None:
+    """Record current timestamp for user's question in SQLite."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        now = time.time()
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO rate_limits (user_id, last_question_time) VALUES (?, ?)",
+                (user_id, now),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error updating rate limit for user {user_id}: {e}")
+
+
+def db_ban_user(user_id: int, banned_by: str = "", reason: str = "", db_path: Optional[str] = None) -> None:
+    """Ban user from sending support questions in SQLite."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO banned_users (user_id, banned_by, reason) VALUES (?, ?, ?)",
+                (user_id, banned_by, reason),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error banning user {user_id}: {e}")
+
+
+def db_unban_user(user_id: int, db_path: Optional[str] = None) -> bool:
+    """Unban user in SQLite. Returns True if user was removed."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
+    except Exception as e:
+        logger.error(f"Error unbanning user {user_id}: {e}")
+        return False
+
+
+def db_is_banned(user_id: int, db_path: Optional[str] = None) -> bool:
+    """Check if user is banned."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+            return cursor.fetchone() is not None
+    except Exception as e:
+        logger.error(f"Error checking ban status for user {user_id}: {e}")
+        return False
+
+
 async def post_init(application: Application) -> None:
-    """Synchronize global in-memory state with persisted application.bot_data on startup."""
-    global pending_requests, admin_rejection_state, roommate_approval_state
+    """Synchronize global in-memory state with persisted application.bot_data and SQLite on startup."""
+    global pending_requests, admin_rejection_state, roommate_approval_state, support_messages
     if "pending_requests" in application.bot_data:
         pending_requests.update(application.bot_data["pending_requests"])
     application.bot_data["pending_requests"] = pending_requests
@@ -118,6 +320,22 @@ async def post_init(application: Application) -> None:
     if "roommate_approval_state" in application.bot_data:
         roommate_approval_state.update(application.bot_data["roommate_approval_state"])
     application.bot_data["roommate_approval_state"] = roommate_approval_state
+
+    # Load support messages from SQLite into in-memory dictionary
+    try:
+        init_db()
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT admin_message_id, user_id FROM support_messages")
+            for msg_id, uid in cursor.fetchall():
+                support_messages[msg_id] = uid
+    except Exception as e:
+        logger.warning(f"Error preloading support messages from SQLite: {e}")
+
+    if "support_messages" in application.bot_data:
+        support_messages.update(application.bot_data["support_messages"])
+    application.bot_data["support_messages"] = support_messages
+
 
 
 DAH_INVITE_SUGGESTION = (
@@ -260,6 +478,60 @@ def find_registered_by_phone(phone: str) -> Optional[Dict[str, any]]:
         logger.error(f"Error in find_registered_by_phone: {e}")
 
     return None
+
+
+def get_user_apartment_info(user_id: int, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> str:
+    """Look up registered apartment number and status for a Telegram user ID."""
+    if context and context.user_data and context.user_data.get("apartment_number"):
+        apt = str(context.user_data.get("apartment_number")).strip()
+        is_owner = context.user_data.get("is_owner")
+        role = "власник" if is_owner else "мешканець"
+        return f"кв. {apt} ({role})"
+
+    if not google_sheets_client:
+        return "не визначено"
+
+    try:
+        spreadsheet = google_sheets_client.open_by_key(SPREADSHEET_ID)
+
+        # 1. Check owners sheet
+        try:
+            sheet = spreadsheet.worksheet(WORKSHEET_NAME)
+            all_values = sheet.get_all_values()
+            if all_values and len(all_values) >= 3:
+                headers = all_values[1]
+                if "Telegram User ID" in headers and "Номер квартири" in headers:
+                    uid_col = headers.index("Telegram User ID")
+                    apt_col = headers.index("Номер квартири")
+                    for row in all_values[2:]:
+                        if len(row) > uid_col and str(row[uid_col]).strip() == str(user_id):
+                            apt = str(row[apt_col]).strip() if len(row) > apt_col else ""
+                            if apt:
+                                return f"кв. {apt} (власник)"
+        except Exception as e:
+            logger.warning(f"Error checking owners sheet for user {user_id}: {e}")
+
+        # 2. Check roommates sheet
+        try:
+            sheet = spreadsheet.worksheet(ROOMMATES_WORKSHEET_NAME)
+            all_values = sheet.get_all_values()
+            if all_values and len(all_values) >= 2:
+                headers = all_values[0]
+                if "Telegram User ID" in headers and "Номер квартири" in headers:
+                    uid_col = headers.index("Telegram User ID")
+                    apt_col = headers.index("Номер квартири")
+                    for row in all_values[1:]:
+                        if len(row) > uid_col and str(row[uid_col]).strip() == str(user_id):
+                            apt = str(row[apt_col]).strip() if len(row) > apt_col else ""
+                            if apt:
+                                return f"кв. {apt} (мешканець)"
+        except Exception as e:
+            logger.warning(f"Error checking roommates sheet for user {user_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error finding apartment for user {user_id}: {e}")
+
+    return "не зареєстрований"
 
 
 def add_to_google_sheets(user_data: dict, admin_name: str, worksheet_name: str = None) -> bool:
@@ -424,20 +696,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     # Clear any previous state
     context.user_data.clear()
 
-    # Create keyboard with phone number share button
+    # Create keyboard with phone number share button and support button
     keyboard = [
-        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)]
+        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)],
+        [KeyboardButton("✉️ Питання адмінам")],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
         f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації.\n\n"
         "Іноді бот може тимчасово не відповідати. Якщо це сталося, скористайтеся командою /start, щоб почати спочатку.\n\n"
-        "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче.",
+        "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче, "
+        "або оберіть «✉️ Питання адмінам», якщо вам потрібна допомога.",
         reply_markup=reply_markup,
     )
 
     return PHONE_NUMBER
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show help instructions and support option."""
+    keyboard = [
+        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)],
+        [KeyboardButton("✉️ Питання адмінам")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+    await update.message.reply_text(
+        "ℹ️ Довідка та зв'язок з адміністраторами:\n\n"
+        "• /start — розпочати процес верифікації для доступу до групи будинку\n"
+        "• /cancel — скасувати поточне заповнення анкети\n"
+        "• ✉️ Питання адмінам — надіслати повідомлення або запитання адміністраторам\n\n"
+        "💡 Ви також можете просто написати будь-яке запитання сюди в чат, "
+        "і бот запитає, чи надіслати його адміністраторам.",
+        reply_markup=reply_markup,
+    )
+    return ConversationHandler.END
+
+
+async def ask_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle click on '✉️ Питання адмінам' button."""
+    await update.message.reply_text(
+        "✉️ Напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
+        "Перед відправкою бот запитає ваше підтвердження.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
 
 
 async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -686,16 +991,59 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         file = await context.bot.get_file(photo.file_id)
         image_source = file.file_path
     elif document:
-        mime_type = document.mime_type or ""
+        mime_type = (document.mime_type or "").lower()
+        file_name = (document.file_name or "").lower()
+        file_ext = os.path.splitext(file_name)[1]
         context.user_data["document_file_id"] = document.file_id
         context.user_data["document_kind"] = "document"
         file = await context.bot.get_file(document.file_id)
 
-        if mime_type.startswith("image/"):
+        # 1. HEIC / HEIF image conversion
+        if (
+            mime_type in ("image/heic", "image/heif")
+            or file_ext in (".heic", ".heif")
+        ):
+            temp_heic_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=file_ext or ".heic", delete=False) as temp_heic:
+                    temp_heic_path = temp_heic.name
+                    await file.download_to_drive(custom_path=temp_heic.name)
+
+                with Image.open(temp_heic_path) as img:
+                    img = img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=90)
+                    image_bytes = buf.getvalue()
+
+                image_source = base64.b64encode(image_bytes).decode("utf-8")
+                is_base64 = True
+                mime_type = "image/jpeg"
+            except Exception as e:
+                logger.error(f"Failed to convert HEIC to JPEG: {e}")
+                await update.message.reply_text(
+                    "❌ Не вдалося обробити файл HEIC. Переконайтеся, що файл не пошкоджений, "
+                    "або надішліть його як звичайне фото чи PDF."
+                )
+                return DOCUMENT
+            finally:
+                if temp_heic_path:
+                    try:
+                        os.remove(temp_heic_path)
+                    except OSError:
+                        logger.warning("Failed to remove temporary HEIC file")
+
+        # 2. Standard image formats (JPEG, PNG, WEBP)
+        elif (
+            mime_type in ("image/jpeg", "image/jpg", "image/png", "image/webp")
+            or file_ext in (".jpg", ".jpeg", ".png", ".webp")
+            or (mime_type.startswith("image/") and mime_type not in ("image/heic", "image/heif"))
+        ):
             image_source = file.file_path
+
+        # 3. PDF document
         elif (
             mime_type == "application/pdf"
-            or (document.file_name and document.file_name.lower().endswith(".pdf"))
+            or file_ext == ".pdf"
         ):
             temp_img_path = None
 
@@ -740,10 +1088,11 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         logger.warning("Failed to remove temporary image file")
         else:
             await update.message.reply_text(
-                "❌ Ми підтримуємо лише зображення (JPG, PNG, HEIC тощо) та PDF. "
+                "❌ Ми підтримуємо лише зображення (JPG, PNG, HEIC) та PDF. "
                 "Завантажте фото договору або PDF-версію, будь ласка."
             )
             return DOCUMENT
+
 
     if not image_source:
         await update.message.reply_text(
@@ -1007,22 +1356,30 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "Будь ласка, перегляньте документ та затвердьте або відхиліть заявку."
     )
 
+    admin_chat_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
+    requests_thread_id = int(os.getenv("ADMIN_REQUESTS_THREAD_ID") or 0) or None
+    extra_kwargs = {}
+    if requests_thread_id:
+        extra_kwargs["message_thread_id"] = requests_thread_id
+
     # Send to admin group
-    logger.info(f"Sending request to admin group {ADMIN_GROUP_ID} for user {user_id}")
+    logger.info(f"Sending request to admin group {admin_chat_id} for user {user_id}")
     try:
         if document_kind == "photo":
             await context.bot.send_photo(
-                chat_id=ADMIN_GROUP_ID,
+                chat_id=admin_chat_id,
                 photo=photo_file_id,
                 caption=admin_caption,
                 reply_markup=reply_markup,
+                **extra_kwargs,
             )
         else:
             await context.bot.send_document(
-                chat_id=ADMIN_GROUP_ID,
+                chat_id=admin_chat_id,
                 document=photo_file_id,
                 caption=admin_caption,
                 reply_markup=reply_markup,
+                **extra_kwargs,
             )
         logger.info(f"Successfully sent request to admin group for user {user_id}")
     except Exception as e:
@@ -1247,20 +1604,78 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.info(f"Admin {admin_name} initiated rejection for user {user_id}, waiting for reason")
 
 
-async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle rejection reason from admin."""
-    # Check if this is a reply to a message waiting for rejection reason
+async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle replies from admins (either rejection reason or response to user question)."""
+    # Check if this is a reply to a message in the admin group
     if not update.message or not update.message.reply_to_message:
         return
 
     message_id = update.message.reply_to_message.message_id
     rejection_dict = get_admin_rejection_state(context)
+    support_dict = get_support_messages(context)
 
+    # 1. Check if this is a reply to a user's support question (check SQLite and in-memory dict)
+    user_id = db_get_support_user_id(message_id) or support_dict.get(message_id)
+    if user_id:
+        admin_name = update.message.from_user.first_name or "Адміністратор"
+        prev_replied_by = db_mark_support_replied(message_id, admin_name)
+        from_chat_id = update.effective_chat.id if update.effective_chat else getattr(update.message, "chat_id", None)
+
+        try:
+            # Deliver reply to user via intro message and copy_message
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✉️ Відповідь адміністратора {admin_name}:",
+            )
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=from_chat_id,
+                message_id=update.message.message_id,
+            )
+
+            # Update original question message in admin group to prevent duplicate replies
+            reply_to_msg = update.message.reply_to_message
+            orig_text = reply_to_msg.text or reply_to_msg.caption or ""
+            status_tag = f"\n\n✅ Відповів: {admin_name}"
+            if status_tag not in orig_text:
+                try:
+                    if getattr(reply_to_msg, "text", None):
+                        await context.bot.edit_message_text(
+                            chat_id=from_chat_id,
+                            message_id=message_id,
+                            text=orig_text + status_tag,
+                        )
+                    elif getattr(reply_to_msg, "caption", None):
+                        await context.bot.edit_message_caption(
+                            chat_id=from_chat_id,
+                            message_id=message_id,
+                            caption=orig_text + status_tag,
+                        )
+                except Exception as edit_err:
+                    logger.warning(f"Could not update original support message text: {edit_err}")
+
+            if prev_replied_by:
+                await update.message.reply_text(
+                    f"ℹ️ Увага: на це питання раніше вже відповів {prev_replied_by}.\n"
+                    f"Додаткову відповідь також доставлено користувачеві (ID: {user_id})."
+                )
+            else:
+                await update.message.reply_text(f"✅ Відповідь надіслано користувачеві (ID: {user_id}).")
+            logger.info(f"Admin {admin_name} delivered reply to user {user_id} via copyMessage")
+        except Exception as e:
+            logger.error(f"Failed to deliver admin reply to user {user_id}: {e}")
+            await update.message.reply_text(f"❌ Не вдалося надіслати відповідь користувачеві: {e}")
+        return
+
+    # 2. Check if this is a rejection reason
     if message_id not in rejection_dict:
         return
 
     user_id = rejection_dict[message_id]
-    rejection_reason = update.message.text.strip()
+    rejection_reason = (update.message.text or update.message.caption or "").strip()
+    if not rejection_reason:
+        await update.message.reply_text("❌ Будь ласка, напишіть причину відхилення текстом.")
+        return
     admin_name = update.message.from_user.first_name
 
     pending = get_pending_requests(context)
@@ -1306,6 +1721,80 @@ async def handle_rejection_reason(update: Update, context: ContextTypes.DEFAULT_
         del admin_rejection_state[message_id]
 
 
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ban a user from sending support questions (Admin only)."""
+    admin_group_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
+    if not update.effective_chat or update.effective_chat.id != admin_group_id:
+        return
+
+    admin_user = update.effective_user
+    admin_name = admin_user.first_name or "Адміністратор"
+    target_user_id = None
+    reason = "Спам"
+
+    # Case 1: Reply to a forwarded support message
+    if update.message and update.message.reply_to_message:
+        rep_msg_id = update.message.reply_to_message.message_id
+        target_user_id = db_get_support_user_id(rep_msg_id) or get_support_messages(context).get(rep_msg_id)
+        if context.args:
+            reason = " ".join(context.args)
+
+    # Case 2: User ID passed as argument: /ban <user_id> [причина]
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+            if len(context.args) > 1:
+                reason = " ".join(context.args[1:])
+        except ValueError:
+            await update.message.reply_text("❌ Формат: `/ban <user_id> [причина]` або зробіть Reply на повідомлення з питанням.")
+            return
+
+    if not target_user_id:
+        await update.message.reply_text(
+            "❌ Не вдалося визначити ID користувача. Зробіть Reply на повідомлення з питанням або напишіть: `/ban <user_id>`"
+        )
+        return
+
+    db_ban_user(target_user_id, banned_by=admin_name, reason=reason)
+    await update.message.reply_text(
+        f"⛔️ Користувача `{target_user_id}` заблоковано в боті.\n"
+        f"Причина: {reason}\n"
+        f"Він більше не зможе надсилати запитання до адміністраторів."
+    )
+    logger.info(f"Admin {admin_name} banned user {target_user_id} with reason: {reason}")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Unban a user from sending support questions (Admin only)."""
+    admin_group_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
+    if not update.effective_chat or update.effective_chat.id != admin_group_id:
+        return
+
+    target_user_id = None
+    if update.message and update.message.reply_to_message:
+        rep_msg_id = update.message.reply_to_message.message_id
+        target_user_id = db_get_support_user_id(rep_msg_id) or get_support_messages(context).get(rep_msg_id)
+    elif context.args:
+        try:
+            target_user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Формат: `/unban <user_id>`")
+            return
+
+    if not target_user_id:
+        await update.message.reply_text("❌ Вкажіть user_id: `/unban <user_id>` або зробіть Reply на повідомлення.")
+        return
+
+    if db_unban_user(target_user_id):
+        await update.message.reply_text(f"✅ Користувача `{target_user_id}` розблоковано.")
+    else:
+        await update.message.reply_text(f"ℹ️ Користувач `{target_user_id}` не був заблокований.")
+
+
+# Backward compatibility alias
+handle_rejection_reason = handle_admin_reply_or_rejection
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel the conversation."""
     context.user_data.clear()
@@ -1322,13 +1811,24 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle unexpected messages when waiting for contact."""
+    text = (getattr(update.message, "text", "") or "").strip()
+    if "питання адмінам" in text.lower():
+        await update.message.reply_text(
+            "✉️ Будь ласка, напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
+            "Перед відправкою бот запитає ваше підтвердження.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
     keyboard = [
-        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)]
+        [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)],
+        [KeyboardButton("✉️ Питання адмінам")],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
         "📱 Будь ласка, поділіться своїм номером телефону за допомогою кнопки нижче.\n\n"
-        "Якщо кнопка зникла або ви хочете почати спочатку — надішліть /start.",
+        "Якщо кнопка зникла або ви хочете почати спочатку — надішліть /start, "
+        "або натисніть «✉️ Питання адмінам».",
         reply_markup=reply_markup,
     )
     return PHONE_NUMBER
@@ -1448,16 +1948,150 @@ async def waiting_owner_approval_message(update: Update, context: ContextTypes.D
 
 
 async def unhandled_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply to messages sent outside active conversation in private chats."""
+    """Reply to messages sent outside active conversation with an option to forward to admins."""
     if not update.effective_chat or update.effective_chat.type != "private":
         return
     if not update.message:
         return
 
+    effective_user = getattr(update, "effective_user", None)
+    user_id = effective_user.id if effective_user else 0
+    if user_id and db_is_banned(user_id):
+        await update.message.reply_text("⛔️ Вам обмежено можливість надсилати запитання до адміністраторів.")
+        return
+
+    text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
+
+    # User clicked support button outside conversation
+    if "питання адмінам" in text.lower():
+        await update.message.reply_text(
+            "✉️ Будь ласка, напишіть ваше запитання до адміністраторів наступним повідомленням.\n\n"
+            "Перед відправкою бот запитає ваше підтвердження.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # User sent a file without text outside conversation
+    if not text:
+        await update.message.reply_text(
+            "🤖 Бот не очікує цього файлу поза анкетою.\n\n"
+            "Скористайтеся /start, щоб розпочати верифікацію, або /help для довідки.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    # Check rate limit before presenting confirmation dialog
+    if user_id:
+        rate_remaining = db_check_rate_limit(user_id, limit_seconds=SUPPORT_RATE_LIMIT_SECONDS)
+        if rate_remaining is not None and rate_remaining > 0:
+            rem_min = int(rate_remaining // 60)
+            rem_sec = int(rate_remaining % 60)
+            time_str = f"{rem_min} хв {rem_sec} с" if rem_min > 0 else f"{rem_sec} с"
+            await update.message.reply_text(
+                f"⏳ Будь ласка, зачекайте ще {time_str} перед відправкою наступного запитання.\n\n"
+                "Ми вже отримали ваше попереднє повідомлення і відповімо якнайшвидше."
+            )
+            return
+
+    # Save pending feedback text in user_data
+    context.user_data["pending_feedback_text"] = text
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
+            InlineKeyboardButton("❌ Ні", callback_data="feedback_cancel"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    preview = text if len(text) <= 300 else text[:297] + "..."
     await update.message.reply_text(
-        "🤖 Бот не очікує цього повідомлення або сесію було скинуто після перезапуску.\n\n"
-        "Будь ласка, скористайтеся командою /start, щоб розпочати верифікацію."
+        f"💬 Ви написали:\n«{preview}»\n\n"
+        "Надіслати це адмінам?",
+        reply_markup=reply_markup,
     )
+
+
+async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle confirmation buttons for sending message to admins."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "feedback_cancel":
+        context.user_data.pop("pending_feedback_text", None)
+        await query.edit_message_text(
+            "Скасовано. Якщо ви хочете розпочати верифікацію — надішліть /start, "
+            "або /help для отримання довідки."
+        )
+        return
+
+    if query.data == "feedback_send":
+        text = context.user_data.pop("pending_feedback_text", None)
+        if not text:
+            await query.edit_message_text("❌ Повідомлення застаріло. Напишіть нове запитання, якщо потрібно.")
+            return
+
+        user = update.effective_user
+        user_id = user.id
+
+        if db_is_banned(user_id):
+            await query.edit_message_text("⛔️ Вам обмежено можливість надсилати запитання до адміністраторів.")
+            return
+
+        rate_remaining = db_check_rate_limit(user_id, limit_seconds=SUPPORT_RATE_LIMIT_SECONDS)
+        if rate_remaining is not None and rate_remaining > 0:
+            rem_min = int(rate_remaining // 60)
+            rem_sec = int(rate_remaining % 60)
+            time_str = f"{rem_min} хв {rem_sec} с" if rem_min > 0 else f"{rem_sec} с"
+            await query.edit_message_text(
+                f"⏳ Будь ласка, зачекайте ще {time_str} перед відправкою наступного запитання."
+            )
+            return
+
+        name_parts = [user.first_name, user.last_name]
+        full_name = " ".join(p for p in name_parts if p) or "Без імені"
+        username_str = f"@{user.username}" if user.username else "немає"
+        apartment_info = get_user_apartment_info(user_id, context)
+
+        admin_text = (
+            "✉️ *Питання до адмінів*\n\n"
+            f"👤 *Ім'я:* {full_name}\n"
+            f"👥 *@нік:* {username_str}\n"
+            f"🏠 *Квартира:* {apartment_info}\n"
+            f"🆔 *User ID:* `{user_id}`\n\n"
+            f"💬 *Повідомлення:*\n{text}\n\n"
+            "ℹ️ _Щоб відповісти користувачеві, зробіть Reply на це повідомлення._"
+        )
+
+        admin_chat_id = int(os.getenv("ADMIN_GROUP_ID") or ADMIN_GROUP_ID or 0)
+        support_thread_id = int(os.getenv("ADMIN_SUPPORT_THREAD_ID") or 0) or None
+        extra_kwargs = {}
+        if support_thread_id:
+            extra_kwargs["message_thread_id"] = support_thread_id
+
+        try:
+            admin_msg = await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=admin_text,
+                parse_mode="Markdown",
+                **extra_kwargs,
+            )
+            # Save mapping in SQLite and in-memory dicts
+            db_save_support_message(admin_msg.message_id, user_id)
+            db_update_rate_limit(user_id)
+
+            support_msgs = get_support_messages(context)
+            support_msgs[admin_msg.message_id] = user_id
+            support_messages[admin_msg.message_id] = user_id
+
+            await query.edit_message_text("Отримали, відповімо тут, у боті.")
+            logger.info(f"Feedback from user {user_id} forwarded to admin group (msg_id {admin_msg.message_id})")
+        except Exception as e:
+            logger.error(f"Error forwarding feedback to admin group: {e}")
+            await query.edit_message_text(
+                "❌ Не вдалося надіслати повідомлення адміністраторам. Спробуйте пізніше або зверніться до підтримки."
+            )
+
 
 
 async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1535,6 +2169,7 @@ def build_application() -> Optional[Application]:
         entry_points=[CommandHandler("start", start)],
         states={
             PHONE_NUMBER: [
+                MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command),
                 MessageHandler(filters.CONTACT, phone_number_received),
                 MessageHandler(filters.ALL & ~filters.COMMAND, phone_number_fallback),
             ],
@@ -1577,19 +2212,26 @@ def build_application() -> Optional[Application]:
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
+            CommandHandler("help", help_command),
+            MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command),
         ],
     )
 
     # Add handlers
     application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command))
+    application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^feedback_"))
     application.add_handler(CallbackQueryHandler(approval_callback))
     application.add_handler(ChatMemberHandler(chat_member_updated, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # Handler for rejection reason in admin group (must be after conv_handler)
+    # Handler for admin replies (response to user question or rejection reason) in admin group
     application.add_handler(
         MessageHandler(
-            filters.TEXT & filters.REPLY & ~filters.COMMAND,
-            handle_rejection_reason,
+            filters.REPLY & ~filters.COMMAND,
+            handle_admin_reply_or_rejection,
         )
     )
 

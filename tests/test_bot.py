@@ -115,6 +115,11 @@ def test_normalize_phone_variations():
 class _FakeTelegramMessage:
     def __init__(self):
         self.replies = []
+        self.text = None
+        self.caption = None
+        self.message_id = 100
+        self.from_user = type("FakeUser", (), {"id": 12345, "first_name": "TestAdmin"})()
+        self.reply_to_message = None
 
     async def reply_text(self, text, *_, **__):
         self.replies.append(text)
@@ -123,12 +128,25 @@ class _FakeTelegramMessage:
 class _FakeUpdate:
     def __init__(self):
         self.message = _FakeTelegramMessage()
+        self.effective_user = type(
+            "FakeUser",
+            (),
+            {
+                "id": 12345,
+                "first_name": "Test",
+                "last_name": "User",
+                "username": "testuser",
+            },
+        )()
+        self.effective_chat = type("FakeChat", (), {"id": 12345, "type": "private"})()
 
 
 class _FakeContext:
-    def __init__(self, user_data, bot_client):
-        self.user_data = user_data
+    def __init__(self, user_data=None, bot_client=None, bot_data=None):
+        self.user_data = user_data if user_data is not None else {}
         self.bot = bot_client
+        self.bot_data = bot_data if bot_data is not None else {}
+        self.args = []
 
 
 @pytest.mark.asyncio
@@ -225,20 +243,33 @@ async def test_fallbacks_respond_and_stay_in_state():
 
 @pytest.mark.asyncio
 async def test_unhandled_private_message():
-    """Verify unhandled private messages send a friendly restart hint."""
+    """Verify unhandled private messages send a friendly restart hint or feedback prompt."""
     class _FakeChat:
         def __init__(self, chat_type):
             self.type = chat_type
 
+    # Case 1: no text (e.g. empty message / unexpected file)
     update = _FakeUpdate()
     update.effective_chat = _FakeChat("private")
+    update.message.text = ""
     context = _FakeContext(user_data={}, bot_client=None)
 
     await bot.unhandled_private_message(update, context)
     assert len(update.message.replies) == 1
     assert "/start" in update.message.replies[0]
 
-    # Group chats are ignored
+    # Case 2: arbitrary text outside conversation prompts feedback confirmation
+    update_text = _FakeUpdate()
+    update_text.effective_chat = _FakeChat("private")
+    update_text.message.text = "Доброго дня, коли мене додадуть?"
+    context_text = _FakeContext(user_data={}, bot_client=None)
+
+    await bot.unhandled_private_message(update_text, context_text)
+    assert len(update_text.message.replies) == 1
+    assert "Надіслати це адмінам?" in update_text.message.replies[0]
+    assert context_text.user_data["pending_feedback_text"] == "Доброго дня, коли мене додадуть?"
+
+    # Case 3: Group chats are ignored
     group_update = _FakeUpdate()
     group_update.effective_chat = _FakeChat("supergroup")
     await bot.unhandled_private_message(group_update, context)
@@ -291,5 +322,343 @@ async def test_build_application_and_post_init(tmp_path, monkeypatch):
     assert bot.pending_requests[999]["test"] == "data"
     # Clean up global
     bot.pending_requests.pop(999, None)
+
+
+@pytest.mark.asyncio
+async def test_heic_document_converted_to_jpeg(monkeypatch):
+    """Verify that HEIC documents are automatically converted to JPEG for OpenAI parsing."""
+    import io
+    import base64
+    from PIL import Image
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+
+    # Create dummy HEIF image bytes
+    heif_buf = io.BytesIO()
+    dummy_img = Image.new("RGB", (20, 20), color="blue")
+    dummy_img.save(heif_buf, format="HEIF")
+    heif_bytes = heif_buf.getvalue()
+
+    # Fake Telegram File download
+    class _FakeTgFile:
+        def __init__(self, data):
+            self.data = data
+
+        async def download_to_drive(self, custom_path):
+            with open(custom_path, "wb") as f:
+                f.write(self.data)
+
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "get_file": AsyncMock(return_value=_FakeTgFile(heif_bytes)),
+        },
+    )()
+
+    # Mock parse_document_with_openai to inspect received arguments
+    captured_call = {}
+
+    async def _mock_parse(source, *, is_base64=False, mime_type="image/jpeg"):
+        captured_call["source"] = source
+        captured_call["is_base64"] = is_base64
+        captured_call["mime_type"] = mime_type
+        return {
+            "apartment_number": "77",
+            "area": "88.5",
+            "document_type": "Договір інвестування",
+        }
+
+    monkeypatch.setattr(bot, "parse_document_with_openai", _mock_parse)
+
+    # Prepare document update with .heic file
+    update = _FakeUpdate()
+    update.message.photo = None
+    update.message.media_group_id = None
+    update.message.document = type(
+        "Document",
+        (),
+        {
+            "file_id": "heic_file_id",
+            "file_name": "scan_contract.HEIC",
+            "mime_type": "image/heic",
+        },
+    )()
+
+    # Add delete mock to replies
+    orig_reply = update.message.reply_text
+    async def _reply_with_delete(text, *args, **kwargs):
+        msg = type("Msg", (), {"delete": AsyncMock()})()
+        await orig_reply(text, *args, **kwargs)
+        return msg
+    update.message.reply_text = _reply_with_delete
+
+    context = _FakeContext(user_data={}, bot_client=fake_bot)
+
+    next_state = await bot.document_received(update, context)
+
+    assert next_state == bot.CONFIRM_DATA
+    assert captured_call["is_base64"] is True
+    assert captured_call["mime_type"] == "image/jpeg"
+
+    # Verify that the converted base64 data is a valid JPEG readable by PIL
+    jpeg_data = base64.b64decode(captured_call["source"])
+    with Image.open(io.BytesIO(jpeg_data)) as converted_img:
+        assert converted_img.format == "JPEG"
+        assert converted_img.size == (20, 20)
+
+
+@pytest.mark.asyncio
+async def test_help_and_ask_admin_commands():
+    """Verify /help and '✉️ Питання адмінам' buttons display instructions."""
+    up_help = _FakeUpdate()
+    res_help = await bot.help_command(up_help, _FakeContext())
+    assert res_help == bot.ConversationHandler.END
+    assert len(up_help.message.replies) == 1
+    assert "Довідка та зв'язок" in up_help.message.replies[0]
+
+    up_ask = _FakeUpdate()
+    res_ask = await bot.ask_admin_command(up_ask, _FakeContext())
+    assert res_ask == bot.ConversationHandler.END
+    assert len(up_ask.message.replies) == 1
+    assert "Напишіть ваше запитання" in up_ask.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_feedback_callback_send_and_db_persistence(tmp_path, monkeypatch):
+    """Verify sending feedback forwards to admin group, stores in SQLite, and confirms to user."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    sent_admin_messages = []
+
+    class _AdminMessage:
+        def __init__(self, message_id):
+            self.message_id = message_id
+
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "send_message": AsyncMock(
+                side_effect=lambda **kwargs: (
+                    sent_admin_messages.append(kwargs) or _AdminMessage(777)
+                )
+            ),
+        },
+    )()
+
+    class _FakeCallbackQuery:
+        def __init__(self, data):
+            self.data = data
+            self.edited_text = None
+
+        async def answer(self):
+            pass
+
+        async def edit_message_text(self, text):
+            self.edited_text = text
+
+    # Case 1: Cancel feedback
+    up_cancel = _FakeUpdate()
+    up_cancel.callback_query = _FakeCallbackQuery("feedback_cancel")
+    ctx_cancel = _FakeContext(user_data={"pending_feedback_text": "Скасуйте мене"})
+    await bot.handle_feedback_callback(up_cancel, ctx_cancel)
+    assert "pending_feedback_text" not in ctx_cancel.user_data
+    assert "Скасовано" in up_cancel.callback_query.edited_text
+
+    # Case 2: Send feedback
+    up_send = _FakeUpdate()
+    up_send.effective_user.id = 555666
+    up_send.effective_user.first_name = "Олександр"
+    up_send.effective_user.last_name = "Петренко"
+    up_send.effective_user.username = "olexandr"
+    up_send.callback_query = _FakeCallbackQuery("feedback_send")
+
+    ctx_send = _FakeContext(
+        user_data={
+            "pending_feedback_text": "Коли підключать домофон?",
+            "apartment_number": "144",
+            "is_owner": True,
+        },
+        bot_client=fake_bot,
+    )
+
+    monkeypatch.setenv("ADMIN_GROUP_ID", "-100777")
+    monkeypatch.setenv("ADMIN_SUPPORT_THREAD_ID", "42")
+
+    await bot.handle_feedback_callback(up_send, ctx_send)
+
+    # User got the exact requested confirmation
+    assert up_send.callback_query.edited_text == "Отримали, відповімо тут, у боті."
+
+    # Forwarded message verified
+    assert len(sent_admin_messages) == 1
+    admin_msg = sent_admin_messages[0]
+    assert admin_msg["chat_id"] == -100777
+    assert admin_msg["message_thread_id"] == 42
+    assert "Олександр Петренко" in admin_msg["text"]
+    assert "@olexandr" in admin_msg["text"]
+    assert "кв. 144" in admin_msg["text"]
+    assert "555666" in admin_msg["text"]
+    assert "Коли підключать домофон?" in admin_msg["text"]
+
+    # Verify persistent storage in SQLite
+    stored_uid = bot.db_get_support_user_id(777, db_file)
+    assert stored_uid == 555666
+
+
+@pytest.mark.asyncio
+async def test_admin_reply_copy_message_and_anti_duplicate(tmp_path, monkeypatch):
+    """Verify admin reply is delivered via copyMessage and prevents silent duplicate replies."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+    bot.db_save_support_message(888, 555666, db_file)
+
+    sent_user_messages = []
+    copied_messages = []
+
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "send_message": AsyncMock(
+                side_effect=lambda **kwargs: sent_user_messages.append(kwargs)
+            ),
+            "copy_message": AsyncMock(
+                side_effect=lambda **kwargs: copied_messages.append(kwargs)
+            ),
+            "edit_message_text": AsyncMock(),
+        },
+    )()
+
+    # First admin replies
+    up_reply1 = _FakeUpdate()
+    up_reply1.effective_chat = type("Chat", (), {"id": -100777, "type": "supergroup"})()
+    up_reply1.message.message_id = 1001
+    up_reply1.message.from_user.first_name = "Роман"
+    up_reply1.message.reply_to_message = type(
+        "OrigMsg",
+        (),
+        {
+            "message_id": 888,
+            "text": "✉️ Питання до адмінів\nПовідомлення: Як справи?",
+            "caption": None,
+        },
+    )()
+
+    ctx = _FakeContext(bot_client=fake_bot)
+    await bot.handle_admin_reply_or_rejection(up_reply1, ctx)
+
+    # Verified delivery to user via copyMessage
+    assert len(sent_user_messages) == 1
+    assert sent_user_messages[0]["chat_id"] == 555666
+    assert "Роман" in sent_user_messages[0]["text"]
+
+    assert len(copied_messages) == 1
+    assert copied_messages[0]["chat_id"] == 555666
+    assert copied_messages[0]["message_id"] == 1001
+
+    # Verified original question message was tagged
+    fake_bot.edit_message_text.assert_awaited_once()
+    edited_call_args = fake_bot.edit_message_text.call_args[1]
+    assert "✅ Відповів: Роман" in edited_call_args["text"]
+
+    assert "Відповідь надіслано користувачеві" in up_reply1.message.replies[0]
+
+    # Second admin tries to reply to the same question
+    up_reply2 = _FakeUpdate()
+    up_reply2.effective_chat = type("Chat", (), {"id": -100777, "type": "supergroup"})()
+    up_reply2.message.message_id = 1002
+    up_reply2.message.from_user.first_name = "Сергій"
+    up_reply2.message.reply_to_message = type(
+        "OrigMsg",
+        (),
+        {
+            "message_id": 888,
+            "text": "✉️ Питання до адмінів\n✅ Відповів: Роман",
+            "caption": None,
+        },
+    )()
+
+    await bot.handle_admin_reply_or_rejection(up_reply2, ctx)
+
+    # Second admin receives duplicate warning
+    assert "вже відповів Роман" in up_reply2.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_support_rate_limit_and_ban(tmp_path, monkeypatch):
+    """Verify rate limits and /ban /unban commands block spam."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    monkeypatch.setenv("ADMIN_GROUP_ID", "-100777")
+    monkeypatch.setattr(bot, "ADMIN_GROUP_ID", -100777)
+
+    # 1. Test rate limit
+    uid = 999111
+    bot.db_update_rate_limit(uid, db_file)
+    rem = bot.db_check_rate_limit(uid, limit_seconds=180, db_path=db_file)
+    assert rem is not None and rem > 170
+
+    # User gets blocked by rate limit in unhandled_private_message
+    up_user = _FakeUpdate()
+    up_user.effective_user.id = uid
+    up_user.message.text = "Ще одне повідомлення"
+    await bot.unhandled_private_message(up_user, _FakeContext())
+    assert "зачекайте ще" in up_user.message.replies[0]
+
+    # 2. Test /ban command by admin
+    up_ban = _FakeUpdate()
+    up_ban.effective_chat = type("Chat", (), {"id": -100777, "type": "supergroup"})()
+    up_ban.message.from_user.first_name = "Admin"
+    ctx_ban = _FakeContext()
+    ctx_ban.args = [str(uid), "Спам", "у", "боті"]
+
+    await bot.ban_command(up_ban, ctx_ban)
+    assert "заблоковано" in up_ban.message.replies[0]
+    assert bot.db_is_banned(uid, db_file) is True
+
+    # Banned user is rejected
+    up_banned_user = _FakeUpdate()
+    up_banned_user.effective_user.id = uid
+    up_banned_user.message.text = "Спроба написати"
+    await bot.unhandled_private_message(up_banned_user, _FakeContext())
+    assert "Вам обмежено можливість" in up_banned_user.message.replies[0]
+
+    # 3. Test /unban command
+    up_unban = _FakeUpdate()
+    up_unban.effective_chat = type("Chat", (), {"id": -100777, "type": "supergroup"})()
+    ctx_unban = _FakeContext()
+    ctx_unban.args = [str(uid)]
+
+    await bot.unban_command(up_unban, ctx_unban)
+    assert "розблоковано" in up_unban.message.replies[0]
+    assert bot.db_is_banned(uid, db_file) is False
+
+
+@pytest.mark.asyncio
+async def test_post_init_restores_support_messages_from_sqlite(tmp_path, monkeypatch):
+    """Verify post_init loads support_messages from SQLite so admin replies work after restart."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+    bot.db_save_support_message(99901, 77701, db_file)
+
+    # Clear memory dictionary to simulate cold restart
+    bot.support_messages.clear()
+
+    fake_app = type("App", (), {"bot_data": {}})()
+    await bot.post_init(fake_app)
+
+    assert bot.support_messages[99901] == 77701
+    assert fake_app.bot_data["support_messages"][99901] == 77701
+
+
 
 
