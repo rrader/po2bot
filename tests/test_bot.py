@@ -669,5 +669,47 @@ async def test_post_init_restores_support_messages_from_sqlite(tmp_path, monkeyp
     assert fake_app.bot_data["support_messages"][99901] == 77701
 
 
+@pytest.mark.asyncio
+async def test_question_text_containing_admin_words_triggers_confirmation(tmp_path, monkeypatch):
+    """Verify that user questions mentioning 'питання адмінам' ask for confirmation instead of being treated as button clicks."""
+    db_file = str(tmp_path / "test_support.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    # 1. Text in unhandled_private_message
+    up = _FakeUpdate()
+    ctx = _FakeContext(user_data={})
+    up.message.text = "Це тестове запитання адмінам"
+    await bot.unhandled_private_message(up, ctx)
+
+    assert "Надіслати це адмінам?" in up.message.replies[0]
+    assert ctx.user_data.get("pending_feedback_text") == "Це тестове запитання адмінам"
+
+    # 2. Exact button click in unhandled_private_message
+    up_btn = _FakeUpdate()
+    ctx_btn = _FakeContext(user_data={})
+    up_btn.message.text = "✉️ Питання адмінам"
+    await bot.unhandled_private_message(up_btn, ctx_btn)
+    assert "наступним повідомленням" in up_btn.message.replies[0]
+    assert "pending_feedback_text" not in ctx_btn.user_data
+
+    # 3. Text in phone_number_fallback
+    up_fallback = _FakeUpdate()
+    ctx_fallback = _FakeContext(user_data={})
+    up_fallback.message.text = "Це тестове запитання адмінам"
+    res = await bot.phone_number_fallback(up_fallback, ctx_fallback)
+    assert res == bot.ConversationHandler.END
+    assert "Надіслати це адмінам?" in up_fallback.message.replies[0]
+    assert ctx_fallback.user_data.get("pending_feedback_text") == "Це тестове запитання адмінам"
+
+    # 4. Button in phone_number_fallback
+    up_fallback_btn = _FakeUpdate()
+    ctx_fallback_btn = _FakeContext(user_data={})
+    up_fallback_btn.message.text = "✉️ Питання адмінам"
+    res_btn = await bot.phone_number_fallback(up_fallback_btn, ctx_fallback_btn)
+    assert res_btn == bot.ConversationHandler.END
+    assert "прямо сюди в чат" in up_fallback_btn.message.replies[0]
+
+
 
 

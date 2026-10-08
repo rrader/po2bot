@@ -1841,13 +1841,32 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle unexpected messages when waiting for contact."""
     text = (getattr(update.message, "text", "") or "").strip()
-    if "питання адмінам" in text.lower():
-        await update.message.reply_text(
-            "✉️ Будь ласка, напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
-            "Перед відправкою бот запитає ваше підтвердження.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
+    if text:
+        clean_text = text.strip().lower().replace("✉️", "").strip()
+        if clean_text in ("питання адмінам", "запитання адмінам"):
+            await update.message.reply_text(
+                "✉️ Будь ласка, напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
+                "Перед відправкою бот запитає ваше підтвердження.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return ConversationHandler.END
+        else:
+            # User wrote actual text while waiting for contact — treat it as feedback/question!
+            context.user_data["pending_feedback_text"] = text
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
+                    InlineKeyboardButton("❌ Ні", callback_data="feedback_cancel"),
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            preview = text if len(text) <= 300 else text[:297] + "..."
+            await update.message.reply_text(
+                f"💬 Ви написали:\n«{preview}»\n\n"
+                "Надіслати це адмінам?",
+                reply_markup=reply_markup,
+            )
+            return ConversationHandler.END
 
     keyboard = [
         [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)],
@@ -2045,8 +2064,9 @@ async def unhandled_private_message(update: Update, context: ContextTypes.DEFAUL
 
     text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
 
-    # User clicked support button outside conversation
-    if "питання адмінам" in text.lower():
+    # User clicked support button outside conversation (exact match)
+    clean_text = text.strip().lower().replace("✉️", "").strip()
+    if clean_text in ("питання адмінам", "запитання адмінам"):
         await update.message.reply_text(
             "✉️ Будь ласка, напишіть ваше запитання до адміністраторів наступним повідомленням.\n\n"
             "Перед відправкою бот запитає ваше підтвердження.",
@@ -2252,7 +2272,7 @@ def build_application() -> Optional[Application]:
         entry_points=[CommandHandler("start", start)],
         states={
             PHONE_NUMBER: [
-                MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command),
+                MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам\s*$"), ask_admin_command),
                 MessageHandler(filters.CONTACT, phone_number_received),
                 MessageHandler(filters.ALL & ~filters.COMMAND, phone_number_fallback),
             ],
@@ -2296,7 +2316,7 @@ def build_application() -> Optional[Application]:
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
             CommandHandler("help", help_command),
-            MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command),
+            MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам\s*$"), ask_admin_command),
         ],
     )
 
@@ -2305,7 +2325,7 @@ def build_application() -> Optional[Application]:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
-    application.add_handler(MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам"), ask_admin_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам\s*$"), ask_admin_command))
     application.add_handler(CallbackQueryHandler(handle_feedback_callback, pattern=r"^feedback_"))
     application.add_handler(CallbackQueryHandler(approval_callback))
     application.add_handler(ChatMemberHandler(chat_member_updated, ChatMemberHandler.MY_CHAT_MEMBER))
