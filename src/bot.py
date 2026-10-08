@@ -50,7 +50,8 @@ ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID") or 0)
 PRIVATE_GROUP_ID = int(os.getenv("PRIVATE_GROUP_ID") or 0)
 ADMIN_SUPPORT_THREAD_ID = int(os.getenv("ADMIN_SUPPORT_THREAD_ID") or 0) or None
 ADMIN_REQUESTS_THREAD_ID = int(os.getenv("ADMIN_REQUESTS_THREAD_ID") or 0) or None
-SUPPORT_RATE_LIMIT_SECONDS = int(os.getenv("SUPPORT_RATE_LIMIT_SECONDS") or 180)
+SUPPORT_RATE_LIMIT_MAX_MESSAGES = int(os.getenv("SUPPORT_RATE_LIMIT_MAX_MESSAGES") or 10)
+SUPPORT_RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("SUPPORT_RATE_LIMIT_WINDOW_SECONDS") or 60)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 GOOGLE_SHEETS_CREDS = os.getenv("GOOGLE_SHEETS_CREDS")
 SPREADSHEET_ID = "1uuGXerA9I0eHTR2fNkektO8uS47T0zR1ITZIA1pnyBM"
@@ -159,6 +160,16 @@ def init_db(db_path: Optional[str] = None) -> None:
                 banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS support_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_support_events_user_time ON support_events(user_id, created_at)
+        """)
         conn.commit()
 
 
@@ -221,23 +232,34 @@ def db_mark_support_replied(admin_message_id: int, admin_name: str, db_path: Opt
         return None
 
 
-def db_check_rate_limit(user_id: int, limit_seconds: int = 180, db_path: Optional[str] = None) -> Optional[float]:
-    """Check if user is rate limited. Returns remaining seconds if limited, else None."""
+def db_check_rate_limit(
+    user_id: int,
+    max_count: int = SUPPORT_RATE_LIMIT_MAX_MESSAGES,
+    window_seconds: int = SUPPORT_RATE_LIMIT_WINDOW_SECONDS,
+    limit_seconds: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> Optional[float]:
+    """Check if user exceeded rate limit (sliding window). Returns remaining seconds if limited, else None."""
     path = db_path or DB_PATH
+    if limit_seconds is not None:
+        window_seconds = limit_seconds
     try:
         init_db(path)
         now = time.time()
+        window_start = now - window_seconds
         with sqlite3.connect(path) as conn:
             cursor = conn.cursor()
+            # Clean up old events (older than 1 hour)
+            cursor.execute("DELETE FROM support_events WHERE created_at < ?", (now - 3600,))
             cursor.execute(
-                "SELECT last_question_time FROM rate_limits WHERE user_id = ?",
-                (user_id,),
+                "SELECT created_at FROM support_events WHERE user_id = ? AND created_at >= ? ORDER BY created_at ASC",
+                (user_id, window_start),
             )
-            row = cursor.fetchone()
-            if row:
-                elapsed = now - row[0]
-                if elapsed < limit_seconds:
-                    return limit_seconds - elapsed
+            rows = cursor.fetchall()
+            if len(rows) >= max_count:
+                oldest_in_window = rows[0][0]
+                remaining = window_seconds - (now - oldest_in_window)
+                return max(1.0, remaining) if remaining > 0 else None
         return None
     except Exception as e:
         logger.error(f"Error checking rate limit for user {user_id}: {e}")
@@ -245,7 +267,7 @@ def db_check_rate_limit(user_id: int, limit_seconds: int = 180, db_path: Optiona
 
 
 def db_update_rate_limit(user_id: int, db_path: Optional[str] = None) -> None:
-    """Record current timestamp for user's question in SQLite."""
+    """Record current timestamp event for user's question in SQLite."""
     path = db_path or DB_PATH
     try:
         init_db(path)
@@ -253,7 +275,7 @@ def db_update_rate_limit(user_id: int, db_path: Optional[str] = None) -> None:
         with sqlite3.connect(path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT OR REPLACE INTO rate_limits (user_id, last_question_time) VALUES (?, ?)",
+                "INSERT INTO support_events (user_id, created_at) VALUES (?, ?)",
                 (user_id, now),
             )
             conn.commit()
@@ -2086,14 +2108,14 @@ async def unhandled_private_message(update: Update, context: ContextTypes.DEFAUL
 
     # Check rate limit before presenting confirmation dialog
     if user_id:
-        rate_remaining = db_check_rate_limit(user_id, limit_seconds=SUPPORT_RATE_LIMIT_SECONDS)
+        rate_remaining = db_check_rate_limit(user_id)
         if rate_remaining is not None and rate_remaining > 0:
             rem_min = int(rate_remaining // 60)
-            rem_sec = int(rate_remaining % 60)
+            rem_sec = int(round(rate_remaining % 60))
             time_str = f"{rem_min} хв {rem_sec} с" if rem_min > 0 else f"{rem_sec} с"
             await update.message.reply_text(
-                f"⏳ Будь ласка, зачекайте ще {time_str} перед відправкою наступного запитання.\n\n"
-                "Ми вже отримали ваше попереднє повідомлення і відповімо якнайшвидше."
+                f"⏳ Ви надіслали багато повідомлень за короткий час.\n\n"
+                f"Будь ласка, зачекайте {time_str} перед відправкою наступного запитання."
             )
             return
 
@@ -2142,13 +2164,14 @@ async def handle_feedback_callback(update: Update, context: ContextTypes.DEFAULT
             await query.edit_message_text("⛔️ Вам обмежено можливість надсилати запитання до адміністраторів.")
             return
 
-        rate_remaining = db_check_rate_limit(user_id, limit_seconds=SUPPORT_RATE_LIMIT_SECONDS)
+        rate_remaining = db_check_rate_limit(user_id)
         if rate_remaining is not None and rate_remaining > 0:
             rem_min = int(rate_remaining // 60)
-            rem_sec = int(rate_remaining % 60)
+            rem_sec = int(round(rate_remaining % 60))
             time_str = f"{rem_min} хв {rem_sec} с" if rem_min > 0 else f"{rem_sec} с"
             await query.edit_message_text(
-                f"⏳ Будь ласка, зачекайте ще {time_str} перед відправкою наступного запитання."
+                f"⏳ Ви надіслали багато повідомлень за короткий час.\n\n"
+                f"Будь ласка, зачекайте {time_str} перед відправкою наступного запитання."
             )
             return
 

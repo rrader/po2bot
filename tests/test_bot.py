@@ -609,18 +609,23 @@ async def test_support_rate_limit_and_ban(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_GROUP_ID", "-100777")
     monkeypatch.setattr(bot, "ADMIN_GROUP_ID", -100777)
 
-    # 1. Test rate limit
+    # 1. Test rate limit (sliding window of 10 messages per 60s)
     uid = 999111
     bot.db_update_rate_limit(uid, db_file)
-    rem = bot.db_check_rate_limit(uid, limit_seconds=180, db_path=db_file)
-    assert rem is not None and rem > 170
+    assert bot.db_check_rate_limit(uid, max_count=10, window_seconds=60, db_path=db_file) is None
+
+    # Simulate 10 events
+    for _ in range(9):
+        bot.db_update_rate_limit(uid, db_file)
+    rem = bot.db_check_rate_limit(uid, max_count=10, window_seconds=60, db_path=db_file)
+    assert rem is not None and rem > 0
 
     # User gets blocked by rate limit in unhandled_private_message
     up_user = _FakeUpdate()
     up_user.effective_user.id = uid
     up_user.message.text = "Ще одне повідомлення"
     await bot.unhandled_private_message(up_user, _FakeContext())
-    assert "зачекайте ще" in up_user.message.replies[0]
+    assert "зачекайте" in up_user.message.replies[0]
 
     # 2. Test /ban command by admin
     up_ban = _FakeUpdate()
