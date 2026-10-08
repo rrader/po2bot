@@ -10,3 +10,6 @@ services:
     volumes:
       # Optional: Mount logs directory if you want persistent logs
       - ./logs:/app/logs
+      # Mount data directory for conversation and request persistence
+      - ./data:/app/data
+
