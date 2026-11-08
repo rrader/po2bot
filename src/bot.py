@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 import threading
 import urllib.parse
+from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Optional, Set
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -2040,15 +2041,20 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
         from_chat_id = update.effective_chat.id if update.effective_chat else getattr(update.message, "chat_id", None)
 
         try:
+            admin_reply_text = (update.message.text or update.message.caption or "").strip()
             # Deliver reply to user via intro message and copy_message
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✉️ Відповідь адміністратора {admin_name}:",
+                _sender_type="admin",
+                _sender_name=admin_name,
             )
             await context.bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=from_chat_id,
                 message_id=update.message.message_id,
+                _admin_name=admin_name,
+                _admin_text=f"✉️ {admin_reply_text}" if admin_reply_text else "✉️ [Повідомлення від адміністратора]",
             )
 
             # Update original question message in admin group to prevent duplicate replies
@@ -2694,12 +2700,111 @@ async def any_private_message_entry(update: Update, context: ContextTypes.DEFAUL
     return await start(update, context)
 
 
+_seen_update_ids: Set[int] = set()
+_seen_update_queue: deque = deque()
+
+
+def _is_duplicate_update(update_id: Optional[int]) -> bool:
+    """Check and record update_id to prevent duplicate handling across handlers."""
+    if not update_id:
+        return False
+    if update_id in _seen_update_ids:
+        return True
+    _seen_update_ids.add(update_id)
+    _seen_update_queue.append(update_id)
+    if len(_seen_update_queue) > 5000:
+        oldest = _seen_update_queue.popleft()
+        _seen_update_ids.discard(oldest)
+    return False
+
+
 async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log incoming messages in private chats to SQLite and update chat_users."""
+    """Log incoming messages, media, and button clicks to SQLite and update chat_users."""
     try:
-        if not update or not getattr(update, "message", None):
+        if not update:
             return
-        msg = update.message
+
+        update_id = getattr(update, "update_id", None)
+        if _is_duplicate_update(update_id):
+            return
+
+        # 1. Handle CallbackQuery (inline button clicks)
+        query = getattr(update, "callback_query", None)
+        if query:
+            user = getattr(update, "effective_user", None)
+            chat = getattr(update, "effective_chat", None) or getattr(getattr(query, "message", None), "chat", None)
+            data = getattr(query, "data", "") or ""
+
+            # Extract human-readable button text from inline keyboard if possible
+            button_label = data
+            msg_obj = getattr(query, "message", None)
+            if msg_obj and getattr(msg_obj, "reply_markup", None):
+                for row in getattr(msg_obj.reply_markup, "inline_keyboard", []):
+                    for btn in row:
+                        if getattr(btn, "callback_data", None) == data:
+                            btn_text = getattr(btn, "text", "")
+                            if btn_text:
+                                button_label = f'"{btn_text}" ({data})'
+                            break
+                    if button_label != data:
+                        break
+
+            # 1a. User clicked button in private chat
+            if chat and chat.type == "private" and user:
+                user_id = user.id
+                first_name = user.first_name or ""
+                last_name = user.last_name or ""
+                username = user.username or ""
+                user_display_name = getattr(user, "full_name", None) or f"{first_name} {last_name}".strip() or "Користувач"
+
+                db_upsert_chat_user(
+                    user_id,
+                    first_name=first_name,
+                    last_name=last_name,
+                    username=username,
+                )
+                db_save_chat_message(
+                    user_id=user_id,
+                    chat_id=chat.id,
+                    message_id=getattr(msg_obj, "message_id", None),
+                    direction="in",
+                    sender_type="user",
+                    sender_name=user_display_name,
+                    text=f"🔘 Натиснуто кнопку: {button_label}",
+                    media_type="callback_query",
+                )
+                return
+
+            # 1b. Admin or owner clicked an action button regarding a user request in admin group
+            target_user_id = None
+            if data.startswith("approve_roommate_") or data.startswith("reject_roommate_"):
+                parts = data.split("_")
+                if len(parts) >= 3 and parts[2].isdigit():
+                    target_user_id = int(parts[2])
+            elif data.startswith("approve_") or data.startswith("reject_"):
+                parts = data.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    target_user_id = int(parts[1])
+
+            if target_user_id and user:
+                admin_name = getattr(user, "full_name", None) or f"{getattr(user, 'first_name', '')} {getattr(user, 'last_name', '') or ''}".strip() or "Адміністратор"
+                db_save_chat_message(
+                    user_id=target_user_id,
+                    chat_id=target_user_id,
+                    message_id=getattr(msg_obj, "message_id", None),
+                    direction="out_admin",
+                    sender_type="admin",
+                    sender_name=admin_name,
+                    text=f"🔘 Адміністратор обрав: {button_label}",
+                    media_type="callback_query",
+                )
+            return
+
+        # 2. Handle Messages and Edited Messages in private chats
+        msg = getattr(update, "message", None) or getattr(update, "edited_message", None)
+        if not msg:
+            return
+
         chat = getattr(update, "effective_chat", None)
         user = getattr(update, "effective_user", None)
         if not chat or chat.type != "private" or not user:
@@ -2710,11 +2815,10 @@ async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         last_name = user.last_name or ""
         username = user.username or ""
 
-        if getattr(msg, "_chat_logged", False):
-            return
-        msg._chat_logged = True
+        text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+        if getattr(update, "edited_message", None):
+            text = f"✏️ [Змінено]: {text}" if text else "✏️ [Повідомлення відредаговано]"
 
-        text = msg.text or msg.caption or ""
         media_type = "text"
         media_path = None
         file_id = None
@@ -2722,10 +2826,18 @@ async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE
         contact = getattr(msg, "contact", None)
         photos = getattr(msg, "photo", None)
         document = getattr(msg, "document", None)
+        voice = getattr(msg, "voice", None)
+        video = getattr(msg, "video", None) or getattr(msg, "video_note", None)
+        sticker = getattr(msg, "sticker", None)
+        location = getattr(msg, "location", None)
+
+        bot_client = getattr(context, "bot", None)
 
         if contact:
             media_type = "contact"
-            text = f"📱 Контакт: {contact.phone_number} ({contact.first_name} {contact.last_name or ''})".strip()
+            c_name = f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '') or ''}".strip()
+            name_suffix = f" ({c_name})" if c_name else ""
+            text = f"📱 Номер телефону: {contact.phone_number}{name_suffix}"
             db_upsert_chat_user(
                 user_id,
                 first_name=first_name,
@@ -2737,23 +2849,63 @@ async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE
             media_type = "photo"
             photo = photos[-1]
             file_id = photo.file_id
-            media_path = await save_media_file(context.bot, file_id, user_id, "photo.jpg")
+            if bot_client:
+                try:
+                    media_path = await save_media_file(bot_client, file_id, user_id, "photo.jpg")
+                except Exception as me:
+                    logger.warning(f"Could not save photo {file_id}: {me}")
             if not text:
                 text = "📷 [Фото]"
         elif document:
             media_type = "document"
             doc = document
             file_id = doc.file_id
-            orig_name = doc.file_name or "document"
-            media_path = await save_media_file(context.bot, file_id, user_id, orig_name)
+            orig_name = getattr(doc, "file_name", None) or "document"
+            if bot_client:
+                try:
+                    media_path = await save_media_file(bot_client, file_id, user_id, orig_name)
+                except Exception as me:
+                    logger.warning(f"Could not save document {file_id}: {me}")
             if not text:
                 text = f"📄 [Документ: {orig_name}]"
+        elif voice:
+            media_type = "voice"
+            file_id = voice.file_id
+            dur = getattr(voice, "duration", 0)
+            if bot_client:
+                try:
+                    media_path = await save_media_file(bot_client, file_id, user_id, "voice.ogg")
+                except Exception as me:
+                    logger.warning(f"Could not save voice {file_id}: {me}")
+            if not text:
+                text = f"🎤 [Голосове повідомлення: {dur}с]"
+        elif video:
+            media_type = "video"
+            if not text:
+                text = "📹 [Відео]"
+        elif sticker:
+            media_type = "sticker"
+            emoji = getattr(sticker, "emoji", "")
+            text = f"🏷 [Стікер {emoji}]".strip()
+        elif location:
+            media_type = "location"
+            lat = getattr(location, "latitude", 0)
+            lon = getattr(location, "longitude", 0)
+            text = f"📍 [Геолокація: {lat:.5f}, {lon:.5f}]"
 
+        # Check user context for apartment and role
         apartment = None
         user_type = None
         if context and hasattr(context, "user_data") and context.user_data:
             apartment = context.user_data.get("apartment_number")
             user_type = context.user_data.get("user_type")
+
+        # Infer user_type from message text if user tapped role buttons
+        clean_lower = text.lower()
+        if "власник" in clean_lower and not user_type:
+            user_type = "Власник"
+        elif ("співмешканець" in clean_lower or "інший користувач" in clean_lower) and not user_type:
+            user_type = "Співмешканець"
 
         db_upsert_chat_user(
             user_id,
@@ -2791,20 +2943,22 @@ def wrap_bot_for_chat_logging(bot_instance):
     orig_send_document = bot_instance.send_document
 
     async def wrapped_send_message(chat_id, text, *args, **kwargs):
+        sender_type = kwargs.pop("_sender_type", None)
+        sender_name = kwargs.pop("_sender_name", None)
         res = await orig_send_message(chat_id, text, *args, **kwargs)
         try:
             int_chat_id = int(chat_id)
             if int_chat_id > 0:
-                sender_type = kwargs.pop("_sender_type", "bot")
-                sender_name = kwargs.pop("_sender_name", "Po2Bot")
-                direction = "out_admin" if sender_type == "admin" else "out_bot"
+                s_type = sender_type or ("admin" if "адміністратор" in str(text or "").lower() else "bot")
+                s_name = sender_name or ("Адміністратор" if s_type == "admin" else "Po2Bot")
+                direction = "out_admin" if s_type == "admin" else "out_bot"
                 db_save_chat_message(
                     user_id=int_chat_id,
                     chat_id=int_chat_id,
                     message_id=getattr(res, "message_id", None),
                     direction=direction,
-                    sender_type=sender_type,
-                    sender_name=sender_name,
+                    sender_type=s_type,
+                    sender_name=s_name,
                     text=str(text or ""),
                     media_type="text",
                 )
@@ -2813,11 +2967,12 @@ def wrap_bot_for_chat_logging(bot_instance):
         return res
 
     async def wrapped_copy_message(chat_id, from_chat_id, message_id, *args, **kwargs):
+        admin_name = kwargs.pop("_admin_name", "Адміністратор")
+        admin_text = kwargs.pop("_admin_text", None)
         res = await orig_copy_message(chat_id, from_chat_id, message_id, *args, **kwargs)
         try:
             int_chat_id = int(chat_id)
             if int_chat_id > 0:
-                admin_name = kwargs.pop("_admin_name", "Адміністратор")
                 db_save_chat_message(
                     user_id=int_chat_id,
                     chat_id=int_chat_id,
@@ -2825,7 +2980,7 @@ def wrap_bot_for_chat_logging(bot_instance):
                     direction="out_admin",
                     sender_type="admin",
                     sender_name=admin_name,
-                    text="✉️ [Повідомлення від адміністратора]",
+                    text=admin_text or "✉️ [Повідомлення від адміністратора]",
                     media_type="copy",
                 )
         except Exception as e:

@@ -1128,6 +1128,155 @@ async def test_log_incoming_update_and_wrapped_bot(tmp_path, monkeypatch):
     assert msgs_after[1]["text"] == "Вітаємо у системі!"
 
 
+@pytest.mark.asyncio
+async def test_log_all_interactions_buttons_contact_media(tmp_path, monkeypatch):
+    """Verify logging for strict TelegramObjects, callback queries, contact sharing, and buttons."""
+    db_file = str(tmp_path / "test_interactions.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    # 1. Strict Message that rejects arbitrary attribute assignment (like TelegramObject)
+    class StrictMessage:
+        def __init__(self, text=None, contact=None):
+            self._frozen = False
+            self.text = text
+            self.caption = None
+            self.contact = contact
+            self.photo = None
+            self.document = None
+            self.voice = None
+            self.video = None
+            self.sticker = None
+            self.location = None
+            self.message_id = 101
+            self._frozen = True
+
+        def __setattr__(self, key, value):
+            if getattr(self, "_frozen", False) and not hasattr(self, key):
+                raise AttributeError(f"'StrictMessage' object has no attribute '{key}'")
+            super().__setattr__(key, value)
+
+    class StrictContact:
+        def __init__(self, phone_number, first_name="Іван", last_name="Франко"):
+            self.phone_number = phone_number
+            self.first_name = first_name
+            self.last_name = last_name
+
+    up = _FakeUpdate()
+    up.update_id = 9001
+    up.effective_chat = type("Chat", (), {"id": 88888, "type": "private"})()
+    up.effective_user.id = 88888
+    up.effective_user.first_name = "Іван"
+    up.effective_user.last_name = "Франко"
+    up.message = StrictMessage(contact=StrictContact("+380509998877"))
+    ctx = _FakeContext()
+
+    # Should not raise AttributeError when logging contact
+    await bot.log_incoming_update(up, ctx)
+
+    user = bot.db_get_chat_user(88888, db_path=db_file)
+    assert user is not None
+    assert user["phone"] == "+380509998877"
+    assert user["first_name"] == "Іван"
+
+    msgs = bot.db_get_chat_messages(88888, db_path=db_file)
+    assert len(msgs) == 1
+    assert msgs[0]["direction"] == "in"
+    assert "+380509998877" in msgs[0]["text"]
+
+    # 2. User clicks reply button "🏠 Я власник квартири"
+    up2 = _FakeUpdate()
+    up2.update_id = 9002
+    up2.effective_chat = type("Chat", (), {"id": 88888, "type": "private"})()
+    up2.effective_user.id = 88888
+    up2.message = StrictMessage(text="🏠 Я власник квартири")
+    await bot.log_incoming_update(up2, ctx)
+
+    user = bot.db_get_chat_user(88888, db_path=db_file)
+    assert user["user_type"] == "Власник"
+
+    msgs = bot.db_get_chat_messages(88888, db_path=db_file)
+    assert len(msgs) == 2
+    assert msgs[1]["text"] == "🏠 Я власник квартири"
+
+    # 3. User clicks inline button (CallbackQuery) in private chat
+    class FakeBtn:
+        def __init__(self, text, callback_data):
+            self.text = text
+            self.callback_data = callback_data
+
+    class FakeMarkup:
+        def __init__(self, buttons):
+            self.inline_keyboard = [buttons]
+
+    up3 = _FakeUpdate()
+    up3.update_id = 9003
+    up3.message = None
+    up3.effective_chat = type("Chat", (), {"id": 88888, "type": "private"})()
+    up3.effective_user.id = 88888
+    up3.effective_user.first_name = "Іван"
+    up3.callback_query = type(
+        "CallbackQuery",
+        (),
+        {
+            "data": "feedback_send",
+            "message": type(
+                "Msg",
+                (),
+                {
+                    "message_id": 105,
+                    "chat": up3.effective_chat,
+                    "reply_markup": FakeMarkup([FakeBtn("✅ Так, надіслати", "feedback_send")]),
+                },
+            )(),
+        },
+    )()
+
+    await bot.log_incoming_update(up3, ctx)
+
+    msgs = bot.db_get_chat_messages(88888, db_path=db_file)
+    assert len(msgs) == 3
+    assert msgs[2]["direction"] == "in"
+    assert "feedback_send" in msgs[2]["text"]
+    assert "✅ Так, надіслати" in msgs[2]["text"]
+
+    # 4. Admin clicks inline approval button for user 88888 in admin group
+    up4 = _FakeUpdate()
+    up4.update_id = 9004
+    up4.message = None
+    admin_group_chat = type("Chat", (), {"id": -100999, "type": "supergroup"})()
+    up4.effective_chat = admin_group_chat
+    up4.effective_user.id = 11111
+    up4.effective_user.first_name = "Олег"
+    up4.effective_user.last_name = "Адмін"
+    up4.callback_query = type(
+        "CallbackQuery",
+        (),
+        {
+            "data": "approve_88888",
+            "message": type(
+                "Msg",
+                (),
+                {
+                    "message_id": 200,
+                    "chat": admin_group_chat,
+                    "reply_markup": FakeMarkup([FakeBtn("✅ Схвалити", "approve_88888")]),
+                },
+            )(),
+        },
+    )()
+
+    await bot.log_incoming_update(up4, ctx)
+
+    msgs = bot.db_get_chat_messages(88888, db_path=db_file)
+    assert len(msgs) == 4
+    assert msgs[3]["direction"] == "out_admin"
+    assert msgs[3]["sender_type"] == "admin"
+    assert "Олег Адмін" in msgs[3]["sender_name"]
+    assert "Схвалити" in msgs[3]["text"]
+
+
+
 
 
 
