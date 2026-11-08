@@ -61,6 +61,8 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Test")  # Default to "Test" for st
 ROOMMATES_WORKSHEET_NAME = os.getenv("ROOMMATES_WORKSHEET_NAME", "СпівмешканціTest")  # Default to "СпівмешканціTest" for staging
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "data/bot_persistence.pickle")
 DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(PERSISTENCE_FILE) or "data", "bot_support.db"))
+PO2BOT_API_TOKEN = os.getenv("PO2BOT_API_TOKEN") or os.getenv("PO2BOT_API_SECRET") or "po2_secret_token_change_me"
+UPLOADS_DIR = os.getenv("UPLOADS_DIR", os.path.join(os.path.dirname(DB_PATH) or "data", "uploads"))
 
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
@@ -172,6 +174,46 @@ def init_db(db_path: Optional[str] = None) -> None:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_support_events_user_time ON support_events(user_id, created_at)
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_users (
+                user_id INTEGER PRIMARY KEY,
+                first_name TEXT,
+                last_name TEXT,
+                username TEXT,
+                phone TEXT,
+                apartment TEXT,
+                user_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_message_text TEXT,
+                last_message_at TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_users_updated ON chat_users(updated_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_users_apartment ON chat_users(apartment)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_users_phone ON chat_users(phone)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_users_last_msg_at ON chat_users(last_message_at DESC)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                direction TEXT NOT NULL,
+                sender_type TEXT NOT NULL,
+                sender_name TEXT,
+                text TEXT,
+                media_type TEXT,
+                media_path TEXT,
+                telegram_file_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_user_time ON chat_messages(user_id, created_at ASC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_user_dir ON chat_messages(user_id, direction)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_media ON chat_messages(media_type)")
         conn.commit()
 
 
@@ -329,6 +371,268 @@ def db_is_banned(user_id: int, db_path: Optional[str] = None) -> bool:
     except Exception as e:
         logger.error(f"Error checking ban status for user {user_id}: {e}")
         return False
+
+
+def db_upsert_chat_user(
+    user_id: int,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+    username: Optional[str] = None,
+    phone: Optional[str] = None,
+    apartment: Optional[str] = None,
+    user_type: Optional[str] = None,
+    last_message_text: Optional[str] = None,
+    last_message_at: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> None:
+    """Insert or update user details in chat_users."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT user_id, first_name, last_name, username, phone, apartment, user_type FROM chat_users WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if row:
+                fn = first_name if first_name is not None else row[1]
+                ln = last_name if last_name is not None else row[2]
+                un = username if username is not None else row[3]
+                ph = phone if phone is not None else row[4]
+                apt = apartment if apartment is not None else row[5]
+                ut = user_type if user_type is not None else row[6]
+
+                updates = [
+                    "first_name = ?",
+                    "last_name = ?",
+                    "username = ?",
+                    "phone = ?",
+                    "apartment = ?",
+                    "user_type = ?",
+                    "updated_at = ?",
+                ]
+                params = [fn, ln, un, ph, apt, ut, now]
+                if last_message_text is not None:
+                    updates.append("last_message_text = ?")
+                    params.append(last_message_text)
+                    updates.append("last_message_at = ?")
+                    params.append(last_message_at or now)
+                params.append(user_id)
+                cursor.execute(f"UPDATE chat_users SET {', '.join(updates)} WHERE user_id = ?", params)
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO chat_users (
+                        user_id, first_name, last_name, username, phone, apartment, user_type,
+                        created_at, updated_at, last_message_text, last_message_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        first_name or "",
+                        last_name or "",
+                        username or "",
+                        phone or "",
+                        apartment or "",
+                        user_type or "",
+                        now,
+                        now,
+                        last_message_text,
+                        last_message_at or (now if last_message_text else None),
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        logger.error(f"Error upserting chat user {user_id}: {e}")
+
+
+def db_save_chat_message(
+    user_id: int,
+    chat_id: int,
+    message_id: Optional[int],
+    direction: str,
+    sender_type: str,
+    sender_name: Optional[str],
+    text: Optional[str],
+    media_type: Optional[str] = "text",
+    media_path: Optional[str] = None,
+    telegram_file_id: Optional[str] = None,
+    created_at: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Optional[int]:
+    """Save message to chat_messages and update chat_users last_message."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        now = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chat_messages (
+                    user_id, chat_id, message_id, direction, sender_type, sender_name,
+                    text, media_type, media_path, telegram_file_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    chat_id,
+                    message_id,
+                    direction,
+                    sender_type,
+                    sender_name,
+                    text,
+                    media_type,
+                    media_path,
+                    telegram_file_id,
+                    now,
+                ),
+            )
+            msg_id = cursor.lastrowid
+
+            snippet = text or (f"[{media_type}]" if media_type else "")
+            if len(snippet) > 100:
+                snippet = snippet[:97] + "..."
+
+            cursor.execute("SELECT user_id FROM chat_users WHERE user_id = ?", (user_id,))
+            if cursor.fetchone():
+                cursor.execute(
+                    "UPDATE chat_users SET last_message_text = ?, last_message_at = ?, updated_at = ? WHERE user_id = ?",
+                    (snippet, now, now, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO chat_users (
+                        user_id, first_name, last_name, username, created_at, updated_at,
+                        last_message_text, last_message_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, sender_name or "", "", "", now, now, snippet, now),
+                )
+            conn.commit()
+            return msg_id
+    except Exception as e:
+        logger.error(f"Error saving chat message for user {user_id}: {e}")
+        return None
+
+
+def db_get_chat_users(
+    limit: int = 50, offset: int = 0, search: Optional[str] = None, db_path: Optional[str] = None
+) -> list:
+    """Retrieve list of chat users with message counts, sorted by last message time."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            query = """
+                SELECT u.user_id, u.first_name, u.last_name, u.username, u.phone, u.apartment, u.user_type,
+                       u.created_at, u.updated_at, u.last_message_text, u.last_message_at,
+                       COUNT(m.id) as message_count
+                FROM chat_users u
+                LEFT JOIN chat_messages m ON u.user_id = m.user_id
+            """
+            params = []
+            if search and search.strip():
+                s = f"%{search.strip()}%"
+                query += " WHERE (u.first_name LIKE ? OR u.last_name LIKE ? OR u.username LIKE ? OR u.phone LIKE ? OR u.apartment LIKE ? OR CAST(u.user_id AS TEXT) LIKE ?)"
+                params.extend([s, s, s, s, s, s])
+
+            query += " GROUP BY u.user_id ORDER BY COALESCE(u.last_message_at, u.updated_at) DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as e:
+        logger.error(f"Error querying chat users: {e}")
+        return []
+
+
+def db_get_chat_messages(
+    user_id: int, limit: int = 100, offset: int = 0, db_path: Optional[str] = None
+) -> list:
+    """Retrieve messages for a specific user ordered chronologically."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, user_id, chat_id, message_id, direction, sender_type, sender_name,
+                       text, media_type, media_path, telegram_file_id, created_at
+                FROM chat_messages
+                WHERE user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (user_id, limit, offset),
+            )
+            rows = cursor.fetchall()
+            messages = [dict(row) for row in rows]
+            messages.reverse()
+            return messages
+    except Exception as e:
+        logger.error(f"Error querying chat messages for {user_id}: {e}")
+        return []
+
+
+def db_get_chat_user(user_id: int, db_path: Optional[str] = None) -> Optional[dict]:
+    """Retrieve single user details from chat_users."""
+    path = db_path or DB_PATH
+    try:
+        init_db(path)
+        with sqlite3.connect(path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM chat_users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"Error getting chat user {user_id}: {e}")
+        return None
+
+
+async def save_media_file(
+    bot_client,
+    file_id: str,
+    user_id: int,
+    original_filename: Optional[str] = None,
+    uploads_dir: Optional[str] = None,
+) -> Optional[str]:
+    """Download media from Telegram and save to uploads/{user_id}/{filename}. Returns relative path."""
+    target_dir = uploads_dir or UPLOADS_DIR
+    try:
+        user_folder = os.path.join(target_dir, str(user_id))
+        os.makedirs(user_folder, exist_ok=True)
+
+        tg_file = await bot_client.get_file(file_id)
+        ext = ""
+        if original_filename:
+            ext = os.path.splitext(original_filename)[1].lower()
+        if not ext and getattr(tg_file, "file_path", None):
+            ext = os.path.splitext(tg_file.file_path)[1].lower()
+        if not ext:
+            ext = ".jpg"
+
+        timestamp = int(time.time())
+        safe_file_id = "".join(c for c in file_id if c.isalnum())[:10]
+        filename = f"{timestamp}_{safe_file_id}{ext}"
+        destination = os.path.join(user_folder, filename)
+
+        await tg_file.download_to_drive(custom_path=destination)
+        return os.path.join("uploads", str(user_id), filename)
+    except Exception as e:
+        logger.error(f"Failed to save media {file_id} for user {user_id}: {e}")
+        return None
 
 
 async def post_init(application: Application) -> None:
@@ -1058,10 +1362,14 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     image_source = None
     is_base64 = False
     mime_type = "image/jpeg"
+    effective_uid = update.effective_user.id if update.effective_user else context.user_data.get("user_id", 0)
 
     if photo:
         context.user_data["document_file_id"] = photo.file_id
         context.user_data["document_kind"] = "photo"
+        saved_path = await save_media_file(context.bot, photo.file_id, effective_uid, "document.jpg")
+        if saved_path:
+            context.user_data["document_media_path"] = saved_path
         file = await context.bot.get_file(photo.file_id)
         image_source = file.file_path
     elif document:
@@ -1070,6 +1378,9 @@ async def document_received(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         file_ext = os.path.splitext(file_name)[1]
         context.user_data["document_file_id"] = document.file_id
         context.user_data["document_kind"] = "document"
+        saved_path = await save_media_file(context.bot, document.file_id, effective_uid, document.file_name)
+        if saved_path:
+            context.user_data["document_media_path"] = saved_path
         file = await context.bot.get_file(document.file_id)
 
         # 1. HEIC / HEIF image conversion
@@ -1404,6 +1715,7 @@ async def send_to_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         "apartment_number": apartment_number,
         "area": area,
         "document_type": document_type,
+        "document_media_path": context.user_data.get("document_media_path", ""),
     }
     pending_requests[user_id] = requests_dict[user_id]
 
@@ -2382,6 +2694,190 @@ async def any_private_message_entry(update: Update, context: ContextTypes.DEFAUL
     return await start(update, context)
 
 
+async def log_incoming_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log incoming messages in private chats to SQLite and update chat_users."""
+    try:
+        if not update or not getattr(update, "message", None):
+            return
+        msg = update.message
+        chat = getattr(update, "effective_chat", None)
+        user = getattr(update, "effective_user", None)
+        if not chat or chat.type != "private" or not user:
+            return
+
+        user_id = user.id
+        first_name = user.first_name or ""
+        last_name = user.last_name or ""
+        username = user.username or ""
+
+        if getattr(msg, "_chat_logged", False):
+            return
+        msg._chat_logged = True
+
+        text = msg.text or msg.caption or ""
+        media_type = "text"
+        media_path = None
+        file_id = None
+
+        contact = getattr(msg, "contact", None)
+        photos = getattr(msg, "photo", None)
+        document = getattr(msg, "document", None)
+
+        if contact:
+            media_type = "contact"
+            text = f"📱 Контакт: {contact.phone_number} ({contact.first_name} {contact.last_name or ''})".strip()
+            db_upsert_chat_user(
+                user_id,
+                first_name=first_name,
+                last_name=last_name,
+                username=username,
+                phone=contact.phone_number,
+            )
+        elif photos:
+            media_type = "photo"
+            photo = photos[-1]
+            file_id = photo.file_id
+            media_path = await save_media_file(context.bot, file_id, user_id, "photo.jpg")
+            if not text:
+                text = "📷 [Фото]"
+        elif document:
+            media_type = "document"
+            doc = document
+            file_id = doc.file_id
+            orig_name = doc.file_name or "document"
+            media_path = await save_media_file(context.bot, file_id, user_id, orig_name)
+            if not text:
+                text = f"📄 [Документ: {orig_name}]"
+
+        apartment = None
+        user_type = None
+        if context and hasattr(context, "user_data") and context.user_data:
+            apartment = context.user_data.get("apartment_number")
+            user_type = context.user_data.get("user_type")
+
+        db_upsert_chat_user(
+            user_id,
+            first_name=first_name,
+            last_name=last_name,
+            username=username,
+            apartment=apartment,
+            user_type=user_type,
+        )
+
+        user_display_name = getattr(user, "full_name", None) or f"{first_name} {last_name}".strip() or "Користувач"
+        msg_id = getattr(msg, "message_id", None)
+
+        db_save_chat_message(
+            user_id=user_id,
+            chat_id=chat.id,
+            message_id=msg_id,
+            direction="in",
+            sender_type="user",
+            sender_name=user_display_name,
+            text=text,
+            media_type=media_type,
+            media_path=media_path,
+            telegram_file_id=file_id,
+        )
+    except Exception as e:
+        logger.error(f"Error logging incoming update: {e}", exc_info=True)
+
+
+def wrap_bot_for_chat_logging(bot_instance):
+    """Wrap bot methods to log outgoing messages in private chats."""
+    orig_send_message = bot_instance.send_message
+    orig_copy_message = bot_instance.copy_message
+    orig_send_photo = bot_instance.send_photo
+    orig_send_document = bot_instance.send_document
+
+    async def wrapped_send_message(chat_id, text, *args, **kwargs):
+        res = await orig_send_message(chat_id, text, *args, **kwargs)
+        try:
+            int_chat_id = int(chat_id)
+            if int_chat_id > 0:
+                sender_type = kwargs.pop("_sender_type", "bot")
+                sender_name = kwargs.pop("_sender_name", "Po2Bot")
+                direction = "out_admin" if sender_type == "admin" else "out_bot"
+                db_save_chat_message(
+                    user_id=int_chat_id,
+                    chat_id=int_chat_id,
+                    message_id=getattr(res, "message_id", None),
+                    direction=direction,
+                    sender_type=sender_type,
+                    sender_name=sender_name,
+                    text=str(text or ""),
+                    media_type="text",
+                )
+        except Exception as e:
+            logger.debug(f"Error logging outgoing send_message: {e}")
+        return res
+
+    async def wrapped_copy_message(chat_id, from_chat_id, message_id, *args, **kwargs):
+        res = await orig_copy_message(chat_id, from_chat_id, message_id, *args, **kwargs)
+        try:
+            int_chat_id = int(chat_id)
+            if int_chat_id > 0:
+                admin_name = kwargs.pop("_admin_name", "Адміністратор")
+                db_save_chat_message(
+                    user_id=int_chat_id,
+                    chat_id=int_chat_id,
+                    message_id=getattr(res, "message_id", None),
+                    direction="out_admin",
+                    sender_type="admin",
+                    sender_name=admin_name,
+                    text="✉️ [Повідомлення від адміністратора]",
+                    media_type="copy",
+                )
+        except Exception as e:
+            logger.debug(f"Error logging outgoing copy_message: {e}")
+        return res
+
+    async def wrapped_send_photo(chat_id, photo, *args, **kwargs):
+        res = await orig_send_photo(chat_id, photo, *args, **kwargs)
+        try:
+            int_chat_id = int(chat_id)
+            if int_chat_id > 0:
+                caption = kwargs.get("caption") or "[Фото]"
+                db_save_chat_message(
+                    user_id=int_chat_id,
+                    chat_id=int_chat_id,
+                    message_id=getattr(res, "message_id", None),
+                    direction="out_bot",
+                    sender_type="bot",
+                    sender_name="Po2Bot",
+                    text=caption,
+                    media_type="photo",
+                )
+        except Exception as e:
+            logger.debug(f"Error logging outgoing send_photo: {e}")
+        return res
+
+    async def wrapped_send_document(chat_id, document, *args, **kwargs):
+        res = await orig_send_document(chat_id, document, *args, **kwargs)
+        try:
+            int_chat_id = int(chat_id)
+            if int_chat_id > 0:
+                caption = kwargs.get("caption") or "[Документ]"
+                db_save_chat_message(
+                    user_id=int_chat_id,
+                    chat_id=int_chat_id,
+                    message_id=getattr(res, "message_id", None),
+                    direction="out_bot",
+                    sender_type="bot",
+                    sender_name="Po2Bot",
+                    text=caption,
+                    media_type="document",
+                )
+        except Exception as e:
+            logger.debug(f"Error logging outgoing send_document: {e}")
+        return res
+
+    object.__setattr__(bot_instance, "send_message", wrapped_send_message)
+    object.__setattr__(bot_instance, "copy_message", wrapped_copy_message)
+    object.__setattr__(bot_instance, "send_photo", wrapped_send_photo)
+    object.__setattr__(bot_instance, "send_document", wrapped_send_document)
+
+
 def build_application() -> Optional[Application]:
     """Build and configure the Application instance."""
     token = os.getenv("BOT_TOKEN") or BOT_TOKEN
@@ -2415,6 +2911,8 @@ def build_application() -> Optional[Application]:
         is_persistent = True
 
     application = builder.build()
+    wrap_bot_for_chat_logging(application.bot)
+    application.add_handler(TypeHandler(Update, log_incoming_update), group=-1)
 
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -2525,15 +3023,46 @@ def main() -> None:
 _bot_start_time = datetime.now()
 
 
+def check_token_auth(handler: BaseHTTPRequestHandler) -> bool:
+    """Validate Bearer token, X-API-Token header, or query param token."""
+    expected = os.getenv("PO2BOT_API_TOKEN") or os.getenv("PO2BOT_API_SECRET") or PO2BOT_API_TOKEN
+    if not expected:
+        return True
+
+    # 1. Authorization: Bearer <token>
+    auth_header = handler.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        if auth_header[7:].strip() == expected:
+            return True
+
+    # 2. X-API-Token or X-Api-Key headers
+    if handler.headers.get("X-API-Token", "").strip() == expected:
+        return True
+    if handler.headers.get("X-Api-Key", "").strip() == expected:
+        return True
+
+    # 3. Query parameter ?token=...
+    parsed = urllib.parse.urlparse(handler.path)
+    qs = urllib.parse.parse_qs(parsed.query)
+    if "token" in qs and qs["token"] and qs["token"][0] == expected:
+        return True
+
+    return False
+
+
 class BotStatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
-            if self.path == "/health":
+            parsed = urllib.parse.urlparse(self.path)
+            path_only = parsed.path
+            qs = urllib.parse.parse_qs(parsed.query)
+
+            if path_only == "/health":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(b'{"status":"ok"}')
-            elif self.path == "/status":
+            elif path_only == "/status":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
@@ -2548,7 +3077,7 @@ class BotStatusHandler(BaseHTTPRequestHandler):
                     "openai_connected": openai_client is not None,
                 }
                 self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-            elif self.path == "/pending":
+            elif path_only == "/pending":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.end_headers()
@@ -2560,8 +3089,83 @@ class BotStatusHandler(BaseHTTPRequestHandler):
                         "apartment": req.get("apartment_number", ""),
                         "user_type": req.get("user_type", ""),
                         "document_type": req.get("document_type", ""),
+                        "document_media_path": req.get("document_media_path", ""),
                     })
                 self.wfile.write(json.dumps({"pending": items}, ensure_ascii=False).encode("utf-8"))
+            elif path_only == "/api/dialogs":
+                if not check_token_auth(self):
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success":false,"error":"Unauthorized"}')
+                    return
+                limit = int(qs.get("limit", [50])[0])
+                offset = int(qs.get("offset", [0])[0])
+                search = qs.get("search", [None])[0]
+                users = db_get_chat_users(limit=limit, offset=offset, search=search)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "users": users}, ensure_ascii=False).encode("utf-8"))
+            elif path_only.startswith("/api/dialogs/"):
+                if not check_token_auth(self):
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success":false,"error":"Unauthorized"}')
+                    return
+                try:
+                    uid_str = path_only.split("/")[3]
+                    target_uid = int(uid_str)
+                    limit = int(qs.get("limit", [100])[0])
+                    offset = int(qs.get("offset", [0])[0])
+                    user = db_get_chat_user(target_uid)
+                    messages = db_get_chat_messages(user_id=target_uid, limit=limit, offset=offset)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": True, "user": user, "messages": messages}, ensure_ascii=False).encode("utf-8"))
+                except Exception as e:
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode("utf-8"))
+            elif path_only.startswith("/api/media/"):
+                if not check_token_auth(self):
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"success":false,"error":"Unauthorized"}')
+                    return
+                parts = path_only.strip("/").split("/")
+                if len(parts) >= 4:
+                    m_user_id = parts[2]
+                    m_filename = parts[3]
+                    if ".." in m_filename or "/" in m_filename or "\\" in m_filename:
+                        self.send_response(400)
+                        self.end_headers()
+                        return
+                    full_media_path = os.path.join(UPLOADS_DIR, m_user_id, m_filename)
+                    if os.path.isfile(full_media_path):
+                        ext = os.path.splitext(m_filename)[1].lower()
+                        types_map = {
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".png": "image/png",
+                            ".webp": "image/webp",
+                            ".pdf": "application/pdf",
+                            ".heic": "image/heic",
+                        }
+                        c_type = types_map.get(ext, "application/octet-stream")
+                        self.send_response(200)
+                        self.send_header("Content-Type", c_type)
+                        self.send_header("Content-Length", str(os.path.getsize(full_media_path)))
+                        self.end_headers()
+                        with open(full_media_path, "rb") as mf:
+                            self.wfile.write(mf.read())
+                        return
+                self.send_response(404)
+                self.end_headers()
             else:
                 self.send_response(404)
                 self.end_headers()

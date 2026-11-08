@@ -1,5 +1,7 @@
+import io
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -833,6 +835,299 @@ async def test_any_private_message_entry_initiates_verification():
     res_msg = await bot.any_private_message_entry(up_support_msg, ctx_support)
     assert res_msg == bot.ConversationHandler.END
     assert "Надіслати це адмінам?" in up_support_msg.message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_init_db_creates_chat_tables_and_indexes(tmp_path, monkeypatch):
+    """Verify that init_db creates chat_users and chat_messages with all required indexes."""
+    db_file = str(tmp_path / "test_chat.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    with sqlite3.connect(db_file) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        assert "chat_users" in tables
+        assert "chat_messages" in tables
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='index'")
+        indexes = [row[0] for row in cursor.fetchall()]
+        assert "idx_chat_users_updated" in indexes
+        assert "idx_chat_users_apartment" in indexes
+        assert "idx_chat_users_phone" in indexes
+        assert "idx_chat_users_last_msg_at" in indexes
+        assert "idx_chat_messages_user_time" in indexes
+        assert "idx_chat_messages_created" in indexes
+        assert "idx_chat_messages_user_dir" in indexes
+        assert "idx_chat_messages_media" in indexes
+
+
+@pytest.mark.asyncio
+async def test_chat_users_and_messages_crud_and_search(tmp_path, monkeypatch):
+    """Verify upserting users, saving messages, searching and retrieving dialogs."""
+    db_file = str(tmp_path / "test_chat_crud.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    # 1. Upsert user
+    bot.db_upsert_chat_user(
+        user_id=1001,
+        first_name="Тарас",
+        last_name="Шевченко",
+        username="taras_sh",
+        phone="+380501112233",
+        apartment="142",
+        user_type="Власник",
+    )
+    user = bot.db_get_chat_user(1001, db_path=db_file)
+    assert user is not None
+    assert user["first_name"] == "Тарас"
+    assert user["apartment"] == "142"
+
+    # 2. Save messages
+    msg1_id = bot.db_save_chat_message(
+        user_id=1001,
+        chat_id=1001,
+        message_id=501,
+        direction="in",
+        sender_type="user",
+        sender_name="Тарас Шевченко",
+        text="/start",
+        created_at="2026-11-08 10:00:00",
+        db_path=db_file,
+    )
+    assert msg1_id is not None
+
+    msg2_id = bot.db_save_chat_message(
+        user_id=1001,
+        chat_id=1001,
+        message_id=502,
+        direction="out_bot",
+        sender_type="bot",
+        sender_name="Po2Bot",
+        text="Вітаємо у боті!",
+        created_at="2026-11-08 10:00:01",
+        db_path=db_file,
+    )
+    assert msg2_id is not None
+
+    messages = bot.db_get_chat_messages(1001, db_path=db_file)
+    assert len(messages) == 2
+    assert messages[0]["text"] == "/start"
+    assert messages[1]["text"] == "Вітаємо у боті!"
+
+    # 3. Add second user
+    bot.db_upsert_chat_user(
+        user_id=1002,
+        first_name="Леся",
+        last_name="Українка",
+        username="lesya_ukr",
+        apartment="205",
+    )
+    bot.db_save_chat_message(
+        user_id=1002,
+        chat_id=1002,
+        message_id=601,
+        direction="in",
+        sender_type="user",
+        sender_name="Леся Українка",
+        text="Добрий день!",
+        created_at="2026-11-08 11:00:00",
+        db_path=db_file,
+    )
+
+    # List all users
+    users = bot.db_get_chat_users(db_path=db_file)
+    assert len(users) == 2
+    assert users[0]["user_id"] == 1002
+    assert users[1]["user_id"] == 1001
+
+    # Search by apartment
+    apt_search = bot.db_get_chat_users(search="142", db_path=db_file)
+    assert len(apt_search) == 1
+    assert apt_search[0]["user_id"] == 1001
+
+    # Search by name
+    name_search = bot.db_get_chat_users(search="Леся", db_path=db_file)
+    assert len(name_search) == 1
+    assert name_search[0]["user_id"] == 1002
+
+
+@pytest.mark.asyncio
+async def test_save_media_file(tmp_path):
+    """Verify that save_media_file downloads and organizes file by user_id."""
+    uploads_dir = str(tmp_path / "uploads")
+
+    class _FakeTgFile:
+        def __init__(self, file_path):
+            self.file_path = file_path
+        async def download_to_drive(self, custom_path):
+            with open(custom_path, "wb") as f:
+                f.write(b"fake_image_content")
+
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {"get_file": AsyncMock(return_value=_FakeTgFile("photos/file_99.png"))},
+    )()
+
+    rel_path = await bot.save_media_file(
+        fake_bot,
+        file_id="tgfile12345",
+        user_id=777,
+        original_filename="passport.png",
+        uploads_dir=uploads_dir,
+    )
+    assert rel_path is not None
+    assert rel_path.startswith("uploads/777/")
+    assert rel_path.endswith(".png")
+
+    full_path = os.path.join(uploads_dir, "777", os.path.basename(rel_path))
+    assert os.path.isfile(full_path)
+    with open(full_path, "rb") as f:
+        assert f.read() == b"fake_image_content"
+
+
+def test_status_server_api_with_secret_token(tmp_path, monkeypatch):
+    """Verify BotStatusHandler authentication and API responses."""
+    db_file = str(tmp_path / "test_api.db")
+    uploads_dir = str(tmp_path / "uploads")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    monkeypatch.setattr(bot, "UPLOADS_DIR", uploads_dir)
+    monkeypatch.setattr(bot, "PO2BOT_API_TOKEN", "super_secret_token_123")
+    monkeypatch.setenv("PO2BOT_API_TOKEN", "super_secret_token_123")
+    bot.init_db(db_file)
+
+    # Seed test user and message
+    bot.db_upsert_chat_user(user_id=555, first_name="Оксана", apartment="77")
+    bot.db_save_chat_message(
+        user_id=555,
+        chat_id=555,
+        message_id=1,
+        direction="in",
+        sender_type="user",
+        sender_name="Оксана",
+        text="Привіт!",
+        db_path=db_file,
+    )
+
+    # Create dummy media file
+    user_media_dir = os.path.join(uploads_dir, "555")
+    os.makedirs(user_media_dir, exist_ok=True)
+    sample_img_path = os.path.join(user_media_dir, "photo.jpg")
+    with open(sample_img_path, "wb") as f:
+        f.write(b"\xff\xd8\xff\xe0test_jpeg")
+
+    # Helper mock request handler
+    class MockHandler(bot.BotStatusHandler):
+        def __init__(self, path, headers=None):
+            self.path = path
+            self.headers = headers or {}
+            self.rfile = io.BytesIO()
+            self.wfile = io.BytesIO()
+            self.response_code = None
+            self.response_headers = {}
+
+        def send_response(self, code, message=None):
+            self.response_code = code
+
+        def send_header(self, keyword, value):
+            self.response_headers[keyword] = value
+
+        def end_headers(self):
+            pass
+
+    # 1. Unauthenticated request to /api/dialogs -> 401
+    h_unauth = MockHandler("/api/dialogs")
+    h_unauth.do_GET()
+    assert h_unauth.response_code == 401
+
+    # 2. Authenticated request with Bearer token to /api/dialogs -> 200
+    h_bearer = MockHandler("/api/dialogs", headers={"Authorization": "Bearer super_secret_token_123"})
+    h_bearer.do_GET()
+    assert h_bearer.response_code == 200
+    data = json.loads(h_bearer.wfile.getvalue().decode("utf-8"))
+    assert data["success"] is True
+    assert len(data["users"]) == 1
+    assert data["users"][0]["user_id"] == 555
+
+    # 3. Authenticated request to /api/dialogs/555 -> 200
+    h_user = MockHandler("/api/dialogs/555", headers={"X-API-Token": "super_secret_token_123"})
+    h_user.do_GET()
+    assert h_user.response_code == 200
+    user_data = json.loads(h_user.wfile.getvalue().decode("utf-8"))
+    assert user_data["success"] is True
+    assert user_data["user"]["apartment"] == "77"
+    assert len(user_data["messages"]) == 1
+    assert user_data["messages"][0]["text"] == "Привіт!"
+
+    # 4. Authenticated request to /api/media/555/photo.jpg -> 200 image/jpeg
+    h_media = MockHandler("/api/media/555/photo.jpg", headers={"Authorization": "Bearer super_secret_token_123"})
+    h_media.do_GET()
+    assert h_media.response_code == 200
+    assert h_media.response_headers["Content-Type"] == "image/jpeg"
+    assert h_media.wfile.getvalue() == b"\xff\xd8\xff\xe0test_jpeg"
+
+    # 5. Directory traversal attack -> 400 or 404
+    h_traversal = MockHandler("/api/media/555/../../etc/passwd", headers={"Authorization": "Bearer super_secret_token_123"})
+    h_traversal.do_GET()
+    assert h_traversal.response_code in (400, 404)
+
+
+@pytest.mark.asyncio
+async def test_log_incoming_update_and_wrapped_bot(tmp_path, monkeypatch):
+    """Verify that log_incoming_update logs incoming user message and wrapper logs outgoing bot reply."""
+    db_file = str(tmp_path / "test_hook.db")
+    monkeypatch.setattr(bot, "DB_PATH", db_file)
+    bot.init_db(db_file)
+
+    # 1. Incoming user message
+    up = _FakeUpdate()
+    up.effective_chat = type("Chat", (), {"id": 12345, "type": "private"})()
+    up.effective_user.id = 12345
+    up.effective_user.first_name = "Андрій"
+    up.message.text = "Привіт, бот!"
+    ctx = _FakeContext(user_data={"apartment_number": "42", "user_type": "Власник"})
+
+    await bot.log_incoming_update(up, ctx)
+
+    user = bot.db_get_chat_user(12345, db_path=db_file)
+    assert user is not None
+    assert user["apartment"] == "42"
+    assert user["first_name"] == "Андрій"
+
+    msgs = bot.db_get_chat_messages(12345, db_path=db_file)
+    assert len(msgs) == 1
+    assert msgs[0]["direction"] == "in"
+    assert msgs[0]["text"] == "Привіт, бот!"
+
+    # 2. Outgoing bot response through wrapped bot
+    fake_bot = type(
+        "FakeBot",
+        (),
+        {
+            "send_message": AsyncMock(
+                side_effect=lambda chat_id, text, *args, **kwargs: type("Msg", (), {"message_id": 99})()
+            ),
+            "copy_message": AsyncMock(
+                side_effect=lambda chat_id, from_chat_id, message_id, *args, **kwargs: type("Msg", (), {"message_id": 100})()
+            ),
+            "send_photo": AsyncMock(return_value=type("Msg", (), {"message_id": 101})()),
+            "send_document": AsyncMock(return_value=type("Msg", (), {"message_id": 102})()),
+        },
+    )()
+    bot.wrap_bot_for_chat_logging(fake_bot)
+
+    # Outgoing to private user chat (chat_id > 0)
+    await fake_bot.send_message(12345, "Вітаємо у системі!")
+
+    msgs_after = bot.db_get_chat_messages(12345, db_path=db_file)
+    assert len(msgs_after) == 2
+    assert msgs_after[1]["direction"] == "out_bot"
+    assert msgs_after[1]["text"] == "Вітаємо у системі!"
+
+
 
 
 
