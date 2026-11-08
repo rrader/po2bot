@@ -8,6 +8,7 @@ import tempfile
 import time
 from datetime import datetime
 import threading
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Optional, Set
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
@@ -19,6 +20,7 @@ from telegram.ext import (
     ConversationHandler,
     ChatMemberHandler,
     PicklePersistence,
+    TypeHandler,
     filters,
     ContextTypes,
 )
@@ -539,11 +541,17 @@ def get_user_apartment_info(user_id: int, context: Optional[ContextTypes.DEFAULT
             sheet = spreadsheet.worksheet(ROOMMATES_WORKSHEET_NAME)
             all_values = sheet.get_all_values()
             if all_values and len(all_values) >= 2:
-                headers = all_values[0]
-                if "Telegram User ID" in headers and "Номер квартири" in headers:
+                headers = None
+                data_start = 1
+                for r_idx in range(min(3, len(all_values))):
+                    if "Telegram User ID" in all_values[r_idx]:
+                        headers = all_values[r_idx]
+                        data_start = r_idx + 1
+                        break
+                if headers and "Номер квартири" in headers:
                     uid_col = headers.index("Telegram User ID")
                     apt_col = headers.index("Номер квартири")
-                    for row in all_values[1:]:
+                    for row in all_values[data_start:]:
                         if len(row) > uid_col and str(row[uid_col]).strip() == str(user_id):
                             apt = str(row[apt_col]).strip() if len(row) > apt_col else ""
                             if apt:
@@ -716,8 +724,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation and ask for phone number."""
     user = update.effective_user
 
+    # Check if this interaction was initiated with a specific button/intent
+    incoming_text = (getattr(update.message, "text", "") or "").strip().lower()
+    is_owner_intent = "власник" in incoming_text
+    is_roommate_intent = "інший" in incoming_text or "користувач" in incoming_text
+
     # Clear any previous state
     context.user_data.clear()
+
+    if is_owner_intent:
+        context.user_data["preselected_is_owner"] = True
+    elif is_roommate_intent:
+        context.user_data["preselected_is_owner"] = False
 
     # Create keyboard with phone number share button and support button
     keyboard = [
@@ -726,14 +744,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
-    await update.message.reply_text(
-        f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації.\n\n"
-        "Іноді бот може тимчасово не відповідати. Якщо це сталося, скористайтеся командою /start, щоб почати спочатку.\n\n"
-        "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче, "
-        "або оберіть «✉️ Питання адмінам», якщо вам потрібна допомога.",
-        reply_markup=reply_markup,
-    )
+    if is_owner_intent:
+        greeting = (
+            f"Привіт, {user.first_name}! Ласкаво просимо до верифікації власників квартир ПО 2.\n\n"
+            "Щоб підтвердити статус власника, будь ласка, поділіться своїм номером телефону, "
+            "натиснувши кнопку нижче, або оберіть «✉️ Питання адмінам», якщо вам потрібна допомога."
+        )
+    elif is_roommate_intent:
+        greeting = (
+            f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації співмешканців ПО 2.\n\n"
+            "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче, "
+            "або оберіть «✉️ Питання адмінам», якщо вам потрібна допомога."
+        )
+    else:
+        greeting = (
+            f"Привіт, {user.first_name}! Ласкаво просимо до процесу верифікації ПО 2.\n\n"
+            "Іноді бот може тимчасово не відповідати. Якщо це сталося, скористайтеся командою /start, щоб почати спочатку.\n\n"
+            "Будь ласка, поділіться своїм номером телефону, натиснувши кнопку нижче, "
+            "або оберіть «✉️ Питання адмінам», якщо вам потрібна допомога."
+        )
 
+    await update.message.reply_text(greeting, reply_markup=reply_markup)
     return PHONE_NUMBER
 
 
@@ -759,8 +790,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 async def ask_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle click on '✉️ Питання адмінам' button."""
+    context.user_data["waiting_for_admin_question"] = True
     await update.message.reply_text(
-        "✉️ Напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
+        "✉️ Будь ласка, напишіть ваше запитання до адміністраторів наступним повідомленням.\n\n"
         "Перед відправкою бот запитає ваше підтвердження.",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -797,6 +829,25 @@ async def phone_number_received(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=reply_markup,
             )
             return USER_TYPE
+
+        preselected = context.user_data.get("preselected_is_owner")
+        if preselected is True:
+            context.user_data["is_owner"] = True
+            await update.message.reply_text(
+                f"✅ Номер телефону отримано: {contact.phone_number}\n\n"
+                f"{DOCUMENT_PROMPT}",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return DOCUMENT
+        elif preselected is False:
+            context.user_data["is_owner"] = False
+            await update.message.reply_text(
+                f"✅ Номер телефону отримано: {contact.phone_number}\n\n"
+                "Будь ласка, вкажіть номер телефону власника квартири (380XXXXXXXXX або 0XXXXXXXXX) "
+                "або його Telegram @username для підтвердження.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return ROOMMATE_OWNER_PHONE
 
         # Ask if owner or other user
         keyboard = [
@@ -1490,6 +1541,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
                     f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
                     f"{DAH_INVITE_SUGGESTION}"
                 ),
+                reply_markup=ReplyKeyboardRemove(),
             )
 
             # Add to Google Sheets (Співмешканці worksheet)
@@ -1520,6 +1572,7 @@ async def handle_roommate_approval(query, context: ContextTypes.DEFAULT_TYPE) ->
         await context.bot.send_message(
             chat_id=roommate_user_id,
             text=f"❌ На жаль, власник {owner_name} відхилив ваш запит на додавання.",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
         # Update owner's message
@@ -1597,6 +1650,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         f"Ви вже є учасником приватної групи."
                         f"{DAH_INVITE_SUGGESTION}"
                     ),
+                    reply_markup=ReplyKeyboardRemove(),
                 )
             else:
                 # Invite user to private group
@@ -1611,6 +1665,7 @@ async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                         f"Натисніть тут, щоб приєднатися до приватної групи:\n{invite_link.invite_link}"
                         f"{DAH_INVITE_SUGGESTION}"
                     ),
+                    reply_markup=ReplyKeyboardRemove(),
                 )
 
             # Add to Google Sheets
@@ -1747,6 +1802,7 @@ async def handle_admin_reply_or_rejection(update: Update, context: ContextTypes.
             "Якщо у вас є запитання, напишіть їх сюди в чат (бот запропонує надіслати їх адмінам), "
             "або скористайтеся /start щоб почати спочатку."
         ),
+        reply_markup=ReplyKeyboardRemove(),
     )
 
     # Update admin message
@@ -1883,34 +1939,11 @@ async def phone_number_fallback(update: Update, context: ContextTypes.DEFAULT_TY
     if text:
         clean_text = text.strip().lower().replace("✉️", "").strip()
         if clean_text in ("питання адмінам", "запитання адмінам"):
-            await update.message.reply_text(
-                "✉️ Будь ласка, напишіть ваше запитання до адміністраторів прямо сюди в чат.\n\n"
-                "Перед відправкою бот запитає ваше підтвердження.",
-                reply_markup=ReplyKeyboardRemove(),
-            )
-            return ConversationHandler.END
-        else:
-            # User wrote actual text while waiting for contact — treat it as feedback/question!
-            context.user_data["pending_feedback_text"] = text
-            reply_ctx = extract_reply_context(update)
-            if reply_ctx:
-                context.user_data["pending_feedback_reply_context"] = reply_ctx
-            else:
-                context.user_data.pop("pending_feedback_reply_context", None)
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Так", callback_data="feedback_send"),
-                    InlineKeyboardButton("❌ Ні", callback_data="feedback_cancel"),
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            preview = text if len(text) <= 300 else text[:297] + "..."
-            await update.message.reply_text(
-                f"💬 Ви написали:\n«{preview}»\n\n"
-                "Надіслати це адмінам?",
-                reply_markup=reply_markup,
-            )
-            return ConversationHandler.END
+            return await ask_admin_command(update, context)
+        elif "власник" in clean_text:
+            context.user_data["preselected_is_owner"] = True
+        elif "інший" in clean_text or "користувач" in clean_text:
+            context.user_data["preselected_is_owner"] = False
 
     keyboard = [
         [KeyboardButton("📱 Поділитися номером телефону", request_contact=True)],
@@ -2121,11 +2154,12 @@ async def unhandled_private_message(update: Update, context: ContextTypes.DEFAUL
     # User clicked support button outside conversation (exact match)
     clean_text = text.strip().lower().replace("✉️", "").strip()
     if clean_text in ("питання адмінам", "запитання адмінам"):
-        await update.message.reply_text(
-            "✉️ Будь ласка, напишіть ваше запитання до адміністраторів наступним повідомленням.\n\n"
-            "Перед відправкою бот запитає ваше підтвердження.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        await ask_admin_command(update, context)
+        return
+
+    # User clicked role button outside active conversation
+    if text.strip() in ("🏠 Я власник квартири", "👥 Інший користувач", "➕ Додати ще одну квартиру"):
+        await start(update, context)
         return
 
     # User sent a file without text outside conversation
@@ -2321,6 +2355,33 @@ async def chat_member_updated(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.error(f"Could not send message to chat {chat.id}: {e}")
 
 
+async def any_private_message_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point for any message or button click in private chat outside active conversation."""
+    if not update.effective_chat or update.effective_chat.type != "private":
+        return ConversationHandler.END
+    if not update.message:
+        return ConversationHandler.END
+
+    effective_user = getattr(update, "effective_user", None)
+    user_id = effective_user.id if effective_user else 0
+    if user_id and db_is_banned(user_id):
+        await update.message.reply_text("⛔️ Вам обмежено можливість надсилати запитання до адміністраторів.")
+        return ConversationHandler.END
+
+    text = (getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
+    clean_text = text.lower().replace("✉️", "").strip()
+
+    if clean_text in ("питання адмінам", "запитання адмінам"):
+        return await ask_admin_command(update, context)
+
+    if context.user_data.get("waiting_for_admin_question"):
+        context.user_data.pop("waiting_for_admin_question", None)
+        await unhandled_private_message(update, context)
+        return ConversationHandler.END
+
+    return await start(update, context)
+
+
 def build_application() -> Optional[Application]:
     """Build and configure the Application instance."""
     token = os.getenv("BOT_TOKEN") or BOT_TOKEN
@@ -2359,7 +2420,14 @@ def build_application() -> Optional[Application]:
     conv_handler = ConversationHandler(
         name="verification_conversation",
         persistent=is_persistent,
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.CONTACT, phone_number_received),
+            MessageHandler(
+                filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.Regex(r"^✉️\s*Питання адмінам\s*$"),
+                any_private_message_entry,
+            ),
+        ],
         states={
             PHONE_NUMBER: [
                 MessageHandler(filters.Regex(r"^✉️\s*Питання адмінам\s*$"), ask_admin_command),

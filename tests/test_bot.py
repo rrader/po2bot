@@ -431,7 +431,7 @@ async def test_help_and_ask_admin_commands():
     res_ask = await bot.ask_admin_command(up_ask, _FakeContext())
     assert res_ask == bot.ConversationHandler.END
     assert len(up_ask.message.replies) == 1
-    assert "Напишіть ваше запитання" in up_ask.message.replies[0]
+    assert "напишіть ваше запитання" in up_ask.message.replies[0].lower()
 
 
 @pytest.mark.asyncio
@@ -698,22 +698,22 @@ async def test_question_text_containing_admin_words_triggers_confirmation(tmp_pa
     assert "наступним повідомленням" in up_btn.message.replies[0]
     assert "pending_feedback_text" not in ctx_btn.user_data
 
-    # 3. Text in phone_number_fallback
+    # 3. Text in phone_number_fallback reminds user to share phone and stays in PHONE_NUMBER
     up_fallback = _FakeUpdate()
     ctx_fallback = _FakeContext(user_data={})
-    up_fallback.message.text = "Це тестове запитання адмінам"
+    up_fallback.message.text = "Привіт, я власник"
     res = await bot.phone_number_fallback(up_fallback, ctx_fallback)
-    assert res == bot.ConversationHandler.END
-    assert "Надіслати це адмінам?" in up_fallback.message.replies[0]
-    assert ctx_fallback.user_data.get("pending_feedback_text") == "Це тестове запитання адмінам"
+    assert res == bot.PHONE_NUMBER
+    assert "поділіться своїм номером телефону" in up_fallback.message.replies[0]
+    assert ctx_fallback.user_data.get("preselected_is_owner") is True
 
-    # 4. Button in phone_number_fallback
+    # 4. Button in phone_number_fallback switches to admin support
     up_fallback_btn = _FakeUpdate()
     ctx_fallback_btn = _FakeContext(user_data={})
     up_fallback_btn.message.text = "✉️ Питання адмінам"
     res_btn = await bot.phone_number_fallback(up_fallback_btn, ctx_fallback_btn)
     assert res_btn == bot.ConversationHandler.END
-    assert "прямо сюди в чат" in up_fallback_btn.message.replies[0]
+    assert "наступним повідомленням" in up_fallback_btn.message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -783,6 +783,57 @@ async def test_reply_in_private_chat_triggers_admin_confirmation(tmp_path, monke
     assert "У відповідь на:" in admin_msg["text"]
     assert "Попереднє повідомлення від бота" in admin_msg["text"]
     assert "Уточніть деталі, будь ласка" in admin_msg["text"]
+
+
+@pytest.mark.asyncio
+async def test_any_private_message_entry_initiates_verification():
+    """Verify that clicking '🏠 Я власник квартири' or sending arbitrary text outside conversation starts verification."""
+    # Case 1: Clicking role button outside active conversation
+    up_role = _FakeUpdate()
+    up_role.effective_chat = type("Chat", (), {"id": 888, "type": "private"})()
+    up_role.effective_user.id = 888
+    up_role.effective_user.first_name = "Сергій"
+    up_role.message.text = "🏠 Я власник квартири"
+    ctx_role = _FakeContext(user_data={})
+
+    state = await bot.any_private_message_entry(up_role, ctx_role)
+    assert state == bot.PHONE_NUMBER
+    assert "поділіться своїм номером телефону" in up_role.message.replies[0]
+    assert ctx_role.user_data.get("preselected_is_owner") is True
+
+    # When contact is received, preselected role skips to DOCUMENT step directly
+    class _FakeContact:
+        def __init__(self, user_id, phone):
+            self.user_id = user_id
+            self.phone_number = phone
+
+    up_contact = _FakeUpdate()
+    up_contact.effective_user.id = 888
+    up_contact.message.contact = _FakeContact(888, "+380501112233")
+    state_contact = await bot.phone_number_received(up_contact, ctx_role)
+    assert state_contact == bot.DOCUMENT
+    assert ctx_role.user_data.get("is_owner") is True
+    assert "завантажте фото або PDF" in up_contact.message.replies[0]
+
+    # Case 2: User explicitly clicked "✉️ Питання адмінам" then sent a question
+    up_support_click = _FakeUpdate()
+    up_support_click.effective_chat = type("Chat", (), {"id": 888, "type": "private"})()
+    up_support_click.message.text = "✉️ Питання адмінам"
+    ctx_support = _FakeContext(user_data={})
+
+    res_click = await bot.any_private_message_entry(up_support_click, ctx_support)
+    assert res_click == bot.ConversationHandler.END
+    assert ctx_support.user_data.get("waiting_for_admin_question") is True
+
+    # Next message is handled as question to admins
+    up_support_msg = _FakeUpdate()
+    up_support_msg.effective_chat = type("Chat", (), {"id": 888, "type": "private"})()
+    up_support_msg.effective_user.id = 888
+    up_support_msg.message.text = "Як дізнатися номер лічильника?"
+    res_msg = await bot.any_private_message_entry(up_support_msg, ctx_support)
+    assert res_msg == bot.ConversationHandler.END
+    assert "Надіслати це адмінам?" in up_support_msg.message.replies[0]
+
 
 
 
