@@ -969,10 +969,10 @@ async def parse_document_with_openai(
                     "content": [
                         {
                             "type": "text",
-                            "text": """Проаналізуй це зображення документа (договір інвестування або витяг з реєстру права власності) та витягни наступну інформацію:
+                            "text": """Проаналізуй це зображення документа (договір інвестування, договір купівлі-продажу або витяг з реєстру права власності) та витягни наступну інформацію:
 1. Номер квартири/приміщення
 2. Загальну площу квартири/приміщення (в квадратних метрах). Якщо у документі згадано кілька площ (наприклад, житлова, балкон, коридор тощо), поверни лише загальну площу всієї квартири.
-3. Тип документа (або "Договір інвестування" або "Право власності (витяг з реєстру)")
+3. Тип документа (або "Договір інвестування" або "Право власності (витяг з реєстру)"). Для договорів купівлі-продажу, дарування чи витягів з ДРРП вказуй "Право власності (витяг з реєстру)".
 
 Якщо якась інформація не розбірлива або відсутня, вкажи null для цього поля."""
                         },
@@ -1605,7 +1605,7 @@ async def area_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Create keyboard for document type
     keyboard = [
         [KeyboardButton("📄 Договір інвестування")],
-        [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+        [KeyboardButton("🏛 Право власності (витяг, купівля-продаж тощо)")],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
@@ -1648,16 +1648,16 @@ async def confirm_data_received(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def document_type_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handle document type and show confirmation."""
-    raw_doc_type = update.message.text.strip()
+    raw_doc_type = update.message.text.strip().lower()
 
-    if "інвест" in raw_doc_type.lower():
+    if "інвест" in raw_doc_type:
         document_type = "Договір інвестування"
-    elif "власност" in raw_doc_type.lower() or "витяг" in raw_doc_type.lower():
+    elif any(kw in raw_doc_type for kw in ["власност", "витяг", "купівл", "купл", "продаж", "даруван", "свідоцтв"]):
         document_type = "Право власності (витяг з реєстру)"
     else:
         keyboard = [
             [KeyboardButton("📄 Договір інвестування")],
-            [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+            [KeyboardButton("🏛 Право власності (витяг, купівля-продаж тощо)")],
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
         await update.message.reply_text(
@@ -2346,7 +2346,7 @@ async def document_type_fallback(update: Update, context: ContextTypes.DEFAULT_T
     """Handle unexpected messages when waiting for document type."""
     keyboard = [
         [KeyboardButton("📄 Договір інвестування")],
-        [KeyboardButton("🏛 Право власності (витяг з реєстру)")],
+        [KeyboardButton("🏛 Право власності (витяг, купівля-продаж тощо)")],
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(

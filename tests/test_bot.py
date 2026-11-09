@@ -1276,6 +1276,32 @@ async def test_log_all_interactions_buttons_contact_media(tmp_path, monkeypatch)
     assert "Схвалити" in msgs[3]["text"]
 
 
+@pytest.mark.asyncio
+async def test_document_type_received_button_and_manual_text():
+    """Verify document_type_received correctly handles new button and manual purchase agreement text."""
+    # 1. New button text
+    up1 = _FakeUpdate()
+    up1.message.text = "🏛 Право власності (витяг, купівля-продаж тощо)"
+    ctx1 = _FakeContext()
+    await bot.document_type_received(up1, ctx1)
+    assert ctx1.user_data["document_type"] == "Право власності (витяг з реєстру)"
+
+    # 2. Manual text from user "Дрговір Куплі продажу"
+    up2 = _FakeUpdate()
+    up2.message.text = "Дрговір Куплі продажу"
+    ctx2 = _FakeContext()
+    await bot.document_type_received(up2, ctx2)
+    assert ctx2.user_data["document_type"] == "Право власності (витяг з реєстру)"
+
+    # 3. Investment agreement
+    up3 = _FakeUpdate()
+    up3.message.text = "📄 Договір інвестування"
+    ctx3 = _FakeContext()
+    await bot.document_type_received(up3, ctx3)
+    assert ctx3.user_data["document_type"] == "Договір інвестування"
+
+
+
 
 
 
